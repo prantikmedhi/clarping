@@ -2,6 +2,7 @@ import Foundation
 import AppKit
 import ServiceManagement
 import UserNotifications
+import Combine
 
 enum MainTab: String, CaseIterable { case dashboard = "Dashboard", settings = "Settings" }
 
@@ -23,13 +24,15 @@ final class AppState: ObservableObject {
     let io = IOWorker()
 
     @Published var accounts: [Account] = []
-    @Published var settings: Settings
-    @Published var snapshots: [UsageSnapshot] = []
+    @Published var settings: Settings { didSet { syncMenuBar() } }
+    @Published var snapshots: [UsageSnapshot] = [] { didSet { syncMenuBar() } }
     @Published var switchLog: [SwitchLogEntry] = []
     @Published var tokenStats = TokenStats()
-    @Published var activeId: String?
+    @Published var activeId: String? { didSet { syncMenuBar() } }
     @Published var polling = false
-    @Published var switchingTo: String?
+    @Published var switchingTo: String? { didSet { syncMenuBar() } }
+    /// Status item label state; see MenuBarModel.
+    let menuBar = MenuBarModel()
     @Published var switchStep: SwitchStep?
     @Published var switchError: String?
     @Published var confirmTarget: Account?
@@ -67,9 +70,34 @@ final class AppState: ObservableObject {
         switchLog = vault.loadSwitchLog()
         activeId = switcher.currentAccountUUID()
         recomputeProjections()
+        syncMenuBar()
     }
 
+    /// Pushes label values to the menu bar model only when they changed.
+    private func syncMenuBar() {
+        let fill = activeSnapshot?.fiveHour.map { Int(min(max($0, 0), 100).rounded()) }
+        let text = menuBarText
+        let switching = switchingTo != nil
+        if menuBar.fill != fill { menuBar.fill = fill }
+        if menuBar.text != text { menuBar.text = text }
+        if menuBar.switching != switching { menuBar.switching = switching }
+    }
+
+    private var debugSink: Any?
+    private var debugPublishes = 0
+
     func start() {
+        if Debug.changes {
+            // Publish-rate counter: how often the whole UI (label included) is invalidated.
+            debugSink = objectWillChange.sink { [weak self] _ in self?.debugPublishes += 1 }
+            Task { [weak self] in
+                while let self {
+                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                    Debug.log("objectWillChange/s=\(self.debugPublishes) polling=\(self.polling) adding=\(self.adding) confirm=\(self.confirmTarget != nil) switching=\(self.switchingTo != nil)")
+                    self.debugPublishes = 0
+                }
+            }
+        }
         if AppState.isBundled, settings.notifyThresholds {
             UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
         }

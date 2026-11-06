@@ -52,37 +52,64 @@ enum SparkIcon {
         return img
     }
 
-    /// Static glyphs keyed by whole-percent fill, so the status item image is
-    /// only redrawn when the value actually changes.
-    private static var cache: [Int: NSImage] = [:]
-    static func cached(fill: Double?) -> NSImage {
-        let key = fill.map { Int(min(max($0, 0), 100).rounded()) } ?? -1
+    /// One template image holding the glyph and the optional usage text, so the
+    /// MenuBarExtra label is a plain `Image`: SwiftUI then sets it on the status
+    /// button directly instead of snapshotting a hosted view on every update.
+    /// Keyed by (whole-percent fill, text); the cache is bounded.
+    private static var cache: [String: NSImage] = [:]
+    static func labelImage(fill: Int?, text: String?) -> NSImage {
+        let key = "\(fill.map(String.init) ?? "-")|\(text ?? "")"
         if let img = cache[key] { return img }
-        let img = image(fill: fill, angle: 0, scale: 1)
+        if cache.count > 64 { cache.removeAll() }
+        let glyph = image(fill: fill.map(Double.init), angle: 0, scale: 1)
+        let img: NSImage
+        if let text, !text.isEmpty {
+            let font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+            let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: NSColor.black]
+            let str = NSAttributedString(string: text, attributes: attrs)
+            let tw = ceil(str.size().width)
+            let h: CGFloat = 18, gap: CGFloat = 4
+            img = NSImage(size: NSSize(width: 18 + gap + tw, height: h), flipped: false) { rect in
+                glyph.draw(in: NSRect(x: 0, y: 0, width: 18, height: 18))
+                let th = ceil(font.ascender - font.descender)
+                str.draw(at: NSPoint(x: 18 + gap, y: ((h - th) / 2).rounded()))
+                return true
+            }
+        } else {
+            img = glyph
+        }
+        img.isTemplate = true
         cache[key] = img
         return img
     }
 }
 
+/// The only state the status item label depends on. AppState writes it
+/// solely when a value actually changes, so the label (and the expensive
+/// MenuBarExtra button re-render behind it) is not invalidated by every
+/// @Published change in the app.
+final class MenuBarModel: ObservableObject {
+    @Published var fill: Int?        // whole-percent 5-hour utilization of the active account
+    @Published var text: String?
+    @Published var switching = false
+}
+
 struct MenuBarLabel: View {
-    @EnvironmentObject var state: AppState
+    @ObservedObject var model: MenuBarModel
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        let fill = state.activeSnapshot?.fiveHour
-        HStack(spacing: 4) {
-            if state.switchingTo != nil && !reduceMotion {
-                // Only while a switch runs: a 20 fps spin on an 18 pt image.
+        if Debug.changes { Debug.tick("MenuBarLabel"); Self._printChanges() }
+        return Group {
+            if model.switching && !reduceMotion {
+                // Only while a switch runs: a 20 fps spin of the glyph alone.
                 TimelineView(.animation(minimumInterval: 1 / 20)) { ctx in
                     let t = ctx.date.timeIntervalSinceReferenceDate
-                    Image(nsImage: SparkIcon.image(fill: fill, angle: (t * 60).truncatingRemainder(dividingBy: 360),
+                    Image(nsImage: SparkIcon.image(fill: model.fill.map(Double.init), angle: (t * 60).truncatingRemainder(dividingBy: 360),
                                                    scale: 0.9 + 0.1 * (0.5 + 0.5 * sin(t * 4))))
                 }
             } else {
-                Image(nsImage: SparkIcon.cached(fill: fill))
-            }
-            if let text = state.menuBarText {
-                Text(text).font(.system(size: 12, weight: .medium).monospacedDigit())
+                Image(nsImage: SparkIcon.labelImage(fill: model.fill, text: model.text))
             }
         }
     }

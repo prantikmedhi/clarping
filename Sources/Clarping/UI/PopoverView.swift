@@ -5,7 +5,8 @@ struct PopoverView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        if Debug.changes { Debug.tick("PopoverView"); Self._printChanges() }
+        return VStack(alignment: .leading, spacing: 10) {
             header
             if state.accounts.isEmpty {
                 emptyState
@@ -34,12 +35,16 @@ struct PopoverView: View {
                     .font(.system(size: 10)).foregroundStyle(Theme.inkSecondary)
                     .contentTransition(.opacity)
             }
-            Button { Task { await state.pollAll() } } label: {
-                Image(systemName: "arrow.clockwise").font(.system(size: 11, weight: .semibold))
-                    .rotationEffect(.degrees(state.polling && !reduceMotion ? 360 : 0))
-                    .animation(state.polling && !reduceMotion ? .linear(duration: 0.9).repeatForever(autoreverses: false) : .default, value: state.polling)
+            // No repeatForever animation here: inside a MenuBarExtra window it
+            // keeps invalidating the scene (and the status item) after polling ends.
+            if state.polling {
+                ProgressView().controlSize(.mini).frame(width: 14, height: 14)
+            } else {
+                Button { Task { await state.pollAll() } } label: {
+                    Image(systemName: "arrow.clockwise").font(.system(size: 11, weight: .semibold)).frame(width: 14, height: 14)
+                }
+                .buttonStyle(.plain).foregroundStyle(Theme.inkSecondary).help("Refresh usage now")
             }
-            .buttonStyle(.plain).foregroundStyle(Theme.inkSecondary).help("Refresh usage now")
         }
     }
 
@@ -63,7 +68,7 @@ struct PopoverView: View {
             }
             HStack(spacing: 6) {
                 Button("Add account") { state.addCurrentAccount() }.buttonStyle(QuietButtonStyle(prominent: state.accounts.isEmpty))
-                    .disabled(state.adding || state.switchingTo != nil)
+                .disabled(state.adding || state.switchingTo != nil)
                     .help("Link the account Claude Code is signed into right now")
                 Spacer()
                 Button("Open Clarping") { WindowManager.shared.show(.dashboard) }.buttonStyle(QuietButtonStyle())
@@ -87,7 +92,8 @@ struct AccountCard: View {
     private var isConfirming: Bool { state.confirmTarget?.id == account.id }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        if Debug.changes { Debug.tick("AccountCard"); Self._printChanges() }
+        return VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
                 Circle().fill(Color(hexString: account.colorHex)).frame(width: 8, height: 8)
                 VStack(alignment: .leading, spacing: 1) {
@@ -159,6 +165,7 @@ struct StatusLine: View {
     @EnvironmentObject var state: AppState
 
     var body: some View {
+        let _ = { if Debug.changes { Debug.tick("StatusLine"); Self._printChanges() } }()
         if let s = state.addStatus {
             HStack(alignment: .top, spacing: 6) {
                 if s.kind == .working {
