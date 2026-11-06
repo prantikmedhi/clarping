@@ -2,6 +2,10 @@
 
 # Clarping
 
+**Claude account switcher for macOS.** Switch between Claude accounts for Claude Code and Claude Desktop in one click, and see live 5-hour, weekly and Fable usage limits from the menu bar.
+
+![Clarping: switch Claude Code and Claude Desktop accounts from the macOS menu bar](assets/brand/social-preview.png)
+
 Clarping is a macOS menu bar app that switches the Claude account used by Claude Code (the `claude` CLI) and Claude Desktop, both at once. I'm on a Max plan, I hit the 5-hour limit often, and I keep a second account for when that happens. Signing out and back in to both apps every time got old, so Clarping does it in one click. Only the login is swapped. Projects, sessions, MCP servers and settings stay as they are.
 
 The menu bar popover also shows each linked account's 5-hour, weekly and Fable limits with their reset times and a plan badge (Max 5x, Max 20x, Pro). A dashboard counts tokens per account, model and day from Claude Code's local logs.
