@@ -12,7 +12,9 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/Clarping"
 
-if [ ! -f "$ROOT/build/AppIcon.icns" ]; then
+# Rebuild the icon when it is missing or the brand source is newer.
+if [ ! -f "$ROOT/build/AppIcon.icns" ] || [ "$ROOT/assets/brand/icon-1024.png" -nt "$ROOT/build/AppIcon.icns" ] \
+   || [ "$ROOT/scripts/make-icon.sh" -nt "$ROOT/build/AppIcon.icns" ]; then
   "$ROOT/scripts/make-icon.sh"
 fi
 cp "$ROOT/build/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"

@@ -56,7 +56,7 @@ struct OnboardingView: View {
             VStack {
                 Spacer()
                 HStack(spacing: 6) {
-                    SparkShape(waist: 0.24).fill(Theme.clay).frame(width: 11, height: 11)
+                    BrandMark().frame(width: 13, height: 13)
                     Text("Clarping").font(.system(size: 12.5, weight: .semibold, design: .serif)).foregroundStyle(Theme.inkSecondary)
                     Spacer()
                 }
@@ -607,7 +607,7 @@ private struct DotsGlass: ViewModifier {
 // Quiet vector drawings, one idea per step. Each runs a single settle
 // animation when it appears (Reduce Motion: drawn in place).
 
-/// The Clarping four-point spark (same geometry as SparkIcon.sparkPath).
+/// A plain four-point spark; stands in for Claude in the Desktop illustration.
 private struct SparkShape: Shape {
     var waist: CGFloat = 0.22
     func path(in rect: CGRect) -> Path {
@@ -664,7 +664,7 @@ private extension View {
     func artCard(radius: CGFloat = 14) -> some View { modifier(ArtCard(radius: radius)) }
 }
 
-/// Step 1: the spark inside two thin usage arcs (5-hour, weekly).
+/// Step 1: the app icon inside two thin usage arcs (5-hour, weekly).
 private struct WelcomeArt: View {
     @StateObject private var drawn = Box(false)
     var body: some View {
@@ -677,7 +677,7 @@ private struct WelcomeArt: View {
             Circle().trim(from: 0, to: drawn.value ? 0.68 : 0)
                 .stroke(Theme.calm, style: StrokeStyle(lineWidth: 3, lineCap: .round))
                 .rotationEffect(.degrees(-90)).frame(width: 146, height: 146)
-            SparkShape().fill(Theme.clay).frame(width: 84, height: 84)
+            AppIconView().frame(width: 124, height: 124)
                 .scaleEffect(drawn.value ? 1 : 0.9)
         }
         .frame(width: 220, height: 220)
@@ -895,7 +895,7 @@ private struct SwitchArt: View {
     }
 }
 
-/// Step 7: a checkmark inside the spark, ring complete.
+/// Step 7: the Split Spark mark with a checkmark badge, ring complete.
 private struct DoneArt: View {
     @StateObject private var drawn = Box(false)
     var body: some View {
@@ -904,10 +904,14 @@ private struct DoneArt: View {
             Circle().trim(from: 0, to: drawn.value ? 1 : 0)
                 .stroke(Theme.calm, style: StrokeStyle(lineWidth: 5, lineCap: .round))
                 .rotationEffect(.degrees(-90)).frame(width: 176, height: 176)
-            SparkShape(waist: 0.3).fill(Theme.clay).frame(width: 118, height: 118)
+            BrandMark().frame(width: 112, height: 112)
             Image(systemName: "checkmark")
-                .font(.system(size: 17, weight: .bold))
+                .font(.system(size: 13, weight: .bold))
                 .foregroundStyle(.white)
+                .frame(width: 30, height: 30)
+                .background(Circle().fill(Theme.calm))
+                .overlay(Circle().stroke(Theme.background, lineWidth: 3))
+                .offset(x: 34, y: 34)
                 .scaleEffect(drawn.value ? 1 : 0.6)
                 .opacity(drawn.value ? 1 : 0)
         }

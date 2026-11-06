@@ -31,7 +31,8 @@ struct MainWindow: View {
     }
 
     private var header: some View {
-        HStack(alignment: .center) {
+        HStack(alignment: .center, spacing: 8) {
+            AppIconView().frame(width: 28, height: 28)
             Text("Clarping")
                 .font(.system(size: 20, weight: .semibold, design: .serif))
                 .foregroundStyle(Theme.ink)
