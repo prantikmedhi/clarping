@@ -20,6 +20,12 @@ enum Entry {
             // turning below (URLSession needs it in a headless process).
             Task.detached {
                 do {
+                    if let id = sw.currentAccountUUID(), let existing = accounts.first(where: { $0.id == id }), !args.contains("--relink") {
+                        print("\(existing.label) is already linked. Log in to another account with `claude /login` first, then run --add-current again (or pass --relink to re-capture).")
+                        code = 3
+                        done = true
+                        return
+                    }
                     let a = try await sw.captureCurrent(into: &accounts, desktop: .skipIfRunning)
                     vault.saveAccounts(accounts)
                     print("captured \(a.label) (\(a.emailDomain))")

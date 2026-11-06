@@ -15,11 +15,7 @@ struct PopoverView: View {
                         .transition(.opacity.combined(with: .scale(scale: 0.98)))
                 }
             }
-            if let err = state.switchError ?? state.errors["_add"] {
-                Text(err).font(.system(size: 11)).foregroundStyle(Theme.clayDeep).fixedSize(horizontal: false, vertical: true)
-            } else if let note = state.captureNote {
-                Text(note).font(.system(size: 11)).foregroundStyle(Theme.inkSecondary).fixedSize(horizontal: false, vertical: true)
-            }
+            StatusLine()
             footer
         }
         .padding(14)
@@ -67,6 +63,7 @@ struct PopoverView: View {
             }
             HStack(spacing: 6) {
                 Button("Add account") { state.addCurrentAccount() }.buttonStyle(QuietButtonStyle(prominent: state.accounts.isEmpty))
+                    .disabled(state.adding || state.switchingTo != nil)
                     .help("Link the account Claude Code is signed into right now")
                 Spacer()
                 Button("Open Clarping") { WindowManager.shared.show(.dashboard) }.buttonStyle(QuietButtonStyle())
@@ -129,7 +126,7 @@ struct AccountCard: View {
                         Button("Cancel") { state.confirmTarget = nil }.buttonStyle(QuietButtonStyle())
                         Button("Switch") { state.performSwitch(to: account) }.buttonStyle(QuietButtonStyle(prominent: true))
                     }
-                    let running = state.runningCLICount
+                    let running = state.runningCLI
                     if running > 0 {
                         Text("\(running) `claude` session\(running == 1 ? " is" : "s are") running: they keep the old login until restarted and may write ~/.claude.json during the switch.")
                             .font(.system(size: 10.5)).foregroundStyle(Theme.clayDeep).fixedSize(horizontal: false, vertical: true)
@@ -152,5 +149,33 @@ struct AccountCard: View {
     private func resetText(_ d: Date?) -> String? {
         guard let d else { return nil }
         return "resets in \(Format.duration(d.timeIntervalSinceNow)) · \(Format.dayClock(d))"
+    }
+}
+
+/// Inline feedback under the cards: add/re-capture progress, errors, notes.
+/// Replaces sheets and alerts, which do not present reliably from a
+/// MenuBarExtra window.
+struct StatusLine: View {
+    @EnvironmentObject var state: AppState
+
+    var body: some View {
+        if let s = state.addStatus {
+            HStack(alignment: .top, spacing: 6) {
+                if s.kind == .working {
+                    ProgressView().controlSize(.mini).padding(.top, 1)
+                } else {
+                    Image(systemName: s.kind == .done ? "checkmark.circle" : "info.circle")
+                        .font(.system(size: 11, weight: .medium)).foregroundStyle(Theme.inkSecondary).padding(.top, 1)
+                }
+                Text(s.text).font(.system(size: 11)).foregroundStyle(s.kind == .done ? Theme.calm : Theme.ink)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .transition(.opacity)
+        }
+        if let err = state.switchError ?? state.errors["_add"] {
+            Text(err).font(.system(size: 11)).foregroundStyle(Theme.clayDeep).fixedSize(horizontal: false, vertical: true)
+        } else if let note = state.captureNote {
+            Text(note).font(.system(size: 11)).foregroundStyle(Theme.inkSecondary).fixedSize(horizontal: false, vertical: true)
+        }
     }
 }

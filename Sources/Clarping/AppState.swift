@@ -5,11 +5,22 @@ import UserNotifications
 
 enum MainTab: String, CaseIterable { case dashboard = "Dashboard", settings = "Settings" }
 
+/// Progress of "Add account" / "Re-capture", shown inline in the popover and
+/// in Settings (sheets and alerts do not present reliably from a MenuBarExtra
+/// window, so nothing modal is used).
+struct AddStatus: Equatable {
+    enum Kind { case working, info, done }
+    var kind: Kind
+    var text: String
+}
+
 @MainActor
 final class AppState: ObservableObject {
     let paths: Paths
     let vault: Vault
     let switcher: Switcher
+    /// All blocking work (keychain, processes, files, log ingest) goes through here.
+    let io = IOWorker()
 
     @Published var accounts: [Account] = []
     @Published var settings: Settings
@@ -25,13 +36,23 @@ final class AppState: ObservableObject {
     @Published var errors: [String: String] = [:]
     @Published var mainTab: MainTab = .dashboard
     @Published var lastPoll: Date?
+    /// Add / re-capture progress; nil when idle and nothing to report.
+    @Published var addStatus: AddStatus?
+    var adding: Bool { addStatus?.kind == .working }
+    /// `claude` CLI processes alive at the last check (refreshed off-main when
+    /// a switch is requested and on every poll; never computed in a view body).
+    @Published var runningCLI = 0
+    /// Burn-rate projection per account, recomputed when a snapshot is recorded
+    /// rather than on every render.
+    @Published var projections: [String: TimeInterval] = [:]
+    @Published var captureNote: String?
 
     private var pollTask: Task<Void, Never>?
     private var ingesting = false
+    private var lastIngestStarted: Date?
     /// Accounts whose stored token is being refreshed right now. A switch to
     /// one of them waits; a refresh never persists over a newer vault entry.
     private var refreshing: Set<String> = []
-    @Published var captureNote: String?
     static var isBundled: Bool { Bundle.main.bundleURL.pathExtension == "app" }
 
     init(paths: Paths) {
@@ -39,78 +60,132 @@ final class AppState: ObservableObject {
         vault = Vault(paths: paths)
         switcher = Switcher(paths: paths, vault: vault)
         switcher.identityCheck = { try await ClaudeAPI.profile(token: $0).accountId }
+        // Small files only; token stats (megabytes) are loaded in start().
         settings = vault.loadSettings()
         accounts = vault.loadAccounts()
         snapshots = vault.loadSnapshots()
         switchLog = vault.loadSwitchLog()
-        tokenStats = vault.loadTokenStats()
         activeId = switcher.currentAccountUUID()
+        recomputeProjections()
     }
 
     func start() {
         if AppState.isBundled, settings.notifyThresholds {
             UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
         }
-        restartPolling()
-        ingestTokens()
+        let vault = self.vault
+        Task { [weak self] in
+            let stats = await self?.io.run { vault.loadTokenStats() } ?? TokenStats()
+            guard let self else { return }
+            self.tokenStats = stats
+            self.restartPolling()
+        }
     }
 
     // MARK: Accounts
 
-    /// Captures the active login. With Desktop switching enabled, Desktop is
-    /// quit for the copy and relaunched (its files cannot be copied while it runs).
-    func addCurrentAccount() {
-        guard switchingTo == nil, !polling else { errors["_add"] = "Busy; try again in a moment"; return }
+    /// Links the login Claude Code holds right now. An account that is already
+    /// linked is not silently re-captured: the user is told to log in to another
+    /// account first. Claude Desktop is never quit from here (see `recapture`).
+    func addCurrentAccount() { captureCurrent(relink: false) }
+
+    /// Explicit re-capture of the active account from Settings. With Desktop
+    /// switching enabled this quits and relaunches Claude Desktop to copy its login.
+    func recapture(_ account: Account) {
+        guard account.id == activeId else { errors[account.id] = "Only the active account can be re-captured"; return }
+        captureCurrent(relink: true)
+    }
+
+    private func captureCurrent(relink: Bool) {
+        guard !adding else { return }
+        guard switchingTo == nil else { addStatus = AddStatus(kind: .info, text: "A switch is in progress; try again when it finishes."); return }
         errors["_add"] = nil
         captureNote = nil
-        let policy: Switcher.DesktopPolicy = settings.switchDesktop ? .quitIfRunning : .skipIfRunning
+        addStatus = AddStatus(kind: .working, text: "Reading the current login…")
+        let switcher = self.switcher, vault = self.vault
         Task {
             do {
+                // An in-flight poll holds the keychain item; wait for it instead of refusing.
+                var waited = 0
+                while polling, waited < 150 {
+                    addStatus = AddStatus(kind: .working, text: "Waiting for the usage poll to finish…")
+                    try? await Task.sleep(nanoseconds: 200_000_000)
+                    waited += 1
+                }
+                guard let currentId = await io.run({ switcher.currentAccountUUID() }) else {
+                    throw SwitchError(message: "Claude Code is not logged in. Run `claude /login` first, then click Add.")
+                }
+                if !relink, let existing = accounts.first(where: { $0.id == currentId }) {
+                    addStatus = AddStatus(kind: .info, text: "\(existing.label) is already linked. Log in to another account with `claude /login` first, then click Add.")
+                    activeId = currentId
+                    return
+                }
+                let desktopRunning = await io.run { switcher.isDesktopRunning() }
+                let policy: Switcher.DesktopPolicy
+                if relink && settings.switchDesktop && desktopRunning {
+                    policy = .quitIfRunning
+                    addStatus = AddStatus(kind: .working, text: "Quitting Claude Desktop to copy its login…")
+                } else {
+                    policy = .skipIfRunning
+                    addStatus = AddStatus(kind: .working, text: "Checking the login with Anthropic…")
+                }
                 var list = accounts
+                // Nonisolated async: runs off the main actor (process spawns, keychain, network).
                 let a = try await switcher.captureCurrent(into: &list, desktop: policy)
                 accounts = list
-                vault.saveAccounts(accounts)
+                let saved = accounts
+                await io.run { vault.saveAccounts(saved) }
                 activeId = a.id
                 errors[a.id] = nil
                 captureNote = switcher.lastCaptureNote
+                addStatus = AddStatus(kind: .done, text: relink ? "Re-captured \(a.label)." : "Linked \(a.label).")
                 await poll(account: a)
                 ingestTokens()
             } catch {
+                addStatus = nil
                 errors["_add"] = error.localizedDescription
             }
         }
     }
 
-    /// `claude` processes running right now; shown before a switch because they
-    /// keep the old login and can write ~/.claude.json concurrently.
-    var runningCLICount: Int { Switcher.runningCLICount() }
-
     func update(_ account: Account) {
         guard let i = accounts.firstIndex(where: { $0.id == account.id }) else { return }
         accounts[i] = account
-        vault.saveAccounts(accounts)
+        persistAccounts()
     }
 
     func remove(_ account: Account) {
-        try? vault.removeAccount(id: account.id)
         accounts.removeAll { $0.id == account.id }
         snapshots.removeAll { $0.accountId == account.id }
-        vault.saveSnapshots(snapshots)
-    }
-
-    func recapture(_ account: Account) {
-        guard account.id == activeId else { errors[account.id] = "Only the active account can be re-captured"; return }
-        addCurrentAccount()
+        projections[account.id] = nil
+        let vault = self.vault, snaps = snapshots, id = account.id
+        Task {
+            await io.run {
+                try? vault.removeAccount(id: id)
+                vault.saveSnapshots(snaps)
+            }
+        }
     }
 
     func saveSettings() {
-        vault.saveSettings(settings)
+        let vault = self.vault, s = settings
+        Task { await io.run { vault.saveSettings(s) } }
         restartPolling()
         if AppState.isBundled {
             do {
                 if settings.launchAtLogin { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
             } catch { errors["_settings"] = error.localizedDescription }
         }
+    }
+
+    private func persistAccounts() {
+        let vault = self.vault, list = accounts
+        Task { await io.run { vault.saveAccounts(list) } }
+    }
+
+    private func persistSnapshots() {
+        let vault = self.vault, snaps = snapshots
+        Task { await io.run { vault.saveSnapshots(snaps) } }
     }
 
     // MARK: Polling
@@ -130,9 +205,17 @@ final class AppState: ObservableObject {
         guard !polling, switchingTo == nil else { return }
         polling = true
         defer { polling = false; lastPoll = Date() }
-        activeId = switcher.currentAccountUUID()
+        let switcher = self.switcher
+        let (id, cli) = await io.run { (switcher.currentAccountUUID(), Switcher.runningCLICount()) }
+        activeId = id
+        runningCLI = cli
         for a in accounts where switchingTo == nil { await poll(account: a) }
         ingestTokens()
+    }
+
+    /// Refreshes the running-CLI count before the switch confirmation is shown.
+    func refreshRunningCLI() {
+        Task { runningCLI = await io.run { Switcher.runningCLICount() } }
     }
 
     /// Active account reads straight from the Claude Code keychain item and is
@@ -140,10 +223,11 @@ final class AppState: ObservableObject {
     /// Other accounts are refreshed from the vault when near expiry.
     func poll(account: Account) async {
         guard switchingTo == nil else { return }
+        let switcher = self.switcher, vault = self.vault
         do {
             var creds: CLICreds
             if account.id == activeId {
-                creds = try switcher.readCLICreds()
+                creds = try await io.run { try switcher.readCLICreds() }
                 // The keychain item and ~/.claude.json can disagree (failed switch, a
                 // running CLI of the old account); never file tokens under the wrong id.
                 if let token = creds.accessToken {
@@ -153,9 +237,10 @@ final class AppState: ObservableObject {
                     }
                 }
                 guard switchingTo == nil else { return }
-                try vault.saveCLICreds(creds, for: account.id)
+                let c = creds
+                try await io.run { try vault.saveCLICreds(c, for: account.id) }
             } else {
-                guard let stored = try vault.cliCreds(for: account.id) else { throw SwitchError(message: "No stored login") }
+                guard let stored = try await io.run({ try vault.cliCreds(for: account.id) }) else { throw SwitchError(message: "No stored login") }
                 creds = stored
                 // Only refresh once the access token is actually expired: a `claude`
                 // session of that account may still hold the same refresh token, and
@@ -166,9 +251,9 @@ final class AppState: ObservableObject {
                     let fresh = try await ClaudeAPI.refresh(creds)
                     // Persist only if nothing else (a switch, a re-capture) replaced the
                     // vault entry while the request was in flight.
-                    let now = try vault.cliCreds(for: account.id)
+                    let now = try await io.run { try vault.cliCreds(for: account.id) }
                     guard switchingTo == nil, now?.refreshToken == stored.refreshToken else { return }
-                    try vault.saveCLICreds(fresh, for: account.id)
+                    try await io.run { try vault.saveCLICreds(fresh, for: account.id) }
                     creds = fresh
                 }
             }
@@ -196,7 +281,8 @@ final class AppState: ObservableObject {
         snapshots.append(snap)
         let cutoff = Date().addingTimeInterval(-8 * 86400)
         snapshots.removeAll { $0.at < cutoff }
-        vault.saveSnapshots(snapshots)
+        persistSnapshots()
+        recomputeProjections()
         guard settings.notifyThresholds, let prev = previous else { return }
         for t in [80.0, 95.0] {
             if let p = prev.fiveHour, let n = snap.fiveHour, p < t, n >= t {
@@ -223,7 +309,17 @@ final class AppState: ObservableObject {
 
     /// Seconds until the 5-hour limit is hit at the current burn rate, from the
     /// last hour of samples. nil when flat, falling, or too few samples.
-    func projection(for id: String) -> TimeInterval? {
+    func projection(for id: String) -> TimeInterval? { projections[id] }
+
+    private func recomputeProjections() {
+        var out: [String: TimeInterval] = [:]
+        for a in accounts {
+            if let p = computeProjection(for: a.id) { out[a.id] = p }
+        }
+        if out != projections { projections = out }
+    }
+
+    private func computeProjection(for id: String) -> TimeInterval? {
         let recent = snapshots.filter { $0.accountId == id && $0.at > Date().addingTimeInterval(-3600) }
         guard let first = recent.first, let last = recent.last, last.at.timeIntervalSince(first.at) > 120,
               let u0 = first.fiveHour, let u1 = last.fiveHour, u1 > u0, u1 < 100 else { return nil }
@@ -249,14 +345,18 @@ final class AppState: ObservableObject {
 
     // MARK: Switching
 
-    func requestSwitch(to account: Account) { confirmTarget = account }
+    func requestSwitch(to account: Account) {
+        confirmTarget = account
+        refreshRunningCLI()
+    }
 
     func performSwitch(to account: Account) {
         confirmTarget = nil
-        guard switchingTo == nil else { return }
+        guard switchingTo == nil, !adding else { return }
         switchingTo = account.id
         switchError = nil
         let from = activeId
+        let switcher = self.switcher, vault = self.vault
         Task {
             // A refresh of the target may be in flight; let it finish or give up.
             for _ in 0..<100 where refreshing.contains(account.id) { try? await Task.sleep(nanoseconds: 200_000_000) }
@@ -266,14 +366,15 @@ final class AppState: ObservableObject {
                     Task { @MainActor in self.switchStep = step }
                 }
                 merge(list)
-                activeId = switcher.currentAccountUUID()
+                activeId = await io.run { switcher.currentAccountUUID() }
                 switchLog.append(SwitchLogEntry(at: Date(), fromId: from, toId: account.id, ok: true, note: nil))
             } catch {
                 merge(list)
                 switchError = error.localizedDescription
                 switchLog.append(SwitchLogEntry(at: Date(), fromId: from, toId: account.id, ok: false, note: error.localizedDescription))
             }
-            vault.saveSwitchLog(switchLog)
+            let log = switchLog
+            await io.run { vault.saveSwitchLog(log) }
             switchingTo = nil
             switchStep = nil
             await poll(account: account)
@@ -290,25 +391,33 @@ final class AppState: ObservableObject {
                 accounts[i].needsRelogin = a.needsRelogin
             }
         }
-        vault.saveAccounts(accounts)
+        persistAccounts()
     }
 
     // MARK: Tokens
 
-    func ingestTokens() {
+    /// Incremental (byte cursors per file) and throttled: at most once a minute,
+    /// one run at a time, entirely off the main actor including the save. The
+    /// published stats only change when the buckets actually changed, so the
+    /// dashboard is not re-rendered for a no-op pass.
+    func ingestTokens(force: Bool = false) {
         guard !ingesting else { return }
+        if !force, let t = lastIngestStarted, Date().timeIntervalSince(t) < 60 { return }
         ingesting = true
+        lastIngestStarted = Date()
         let input = tokenStats
         let projects = paths.claudeProjects
         let attribute = TokenIngest.attributor(log: switchLog, activeId: activeId)
+        let vault = self.vault
         Task.detached(priority: .utility) { [weak self] in
             var result = input
             TokenIngest.ingest(stats: &result, projects: projects, attribute: attribute)
+            let changed = result.buckets != input.buckets || result.cursors != input.cursors
+            if changed { vault.saveTokenStats(result) }
             let final = result
             await MainActor.run { [weak self] in
                 guard let self else { return }
-                self.tokenStats = final
-                self.vault.saveTokenStats(final)
+                if changed { self.tokenStats = final }
                 self.ingesting = false
             }
         }

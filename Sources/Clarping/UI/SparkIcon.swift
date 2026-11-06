@@ -51,6 +51,17 @@ enum SparkIcon {
         img.isTemplate = true
         return img
     }
+
+    /// Static glyphs keyed by whole-percent fill, so the status item image is
+    /// only redrawn when the value actually changes.
+    private static var cache: [Int: NSImage] = [:]
+    static func cached(fill: Double?) -> NSImage {
+        let key = fill.map { Int(min(max($0, 0), 100).rounded()) } ?? -1
+        if let img = cache[key] { return img }
+        let img = image(fill: fill, angle: 0, scale: 1)
+        cache[key] = img
+        return img
+    }
 }
 
 struct MenuBarLabel: View {
@@ -58,16 +69,20 @@ struct MenuBarLabel: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        let animating = state.switchingTo != nil && !reduceMotion
-        TimelineView(.animation(minimumInterval: 1 / 30, paused: !animating)) { ctx in
-            let t = ctx.date.timeIntervalSinceReferenceDate
-            let angle = animating ? (t * 60).truncatingRemainder(dividingBy: 360) : 0
-            let scale = animating ? 0.9 + 0.1 * (0.5 + 0.5 * sin(t * 4)) : 1
-            HStack(spacing: 4) {
-                Image(nsImage: SparkIcon.image(fill: state.activeSnapshot?.fiveHour, angle: angle, scale: scale))
-                if let text = state.menuBarText {
-                    Text(text).font(.system(size: 12, weight: .medium).monospacedDigit())
+        let fill = state.activeSnapshot?.fiveHour
+        HStack(spacing: 4) {
+            if state.switchingTo != nil && !reduceMotion {
+                // Only while a switch runs: a 20 fps spin on an 18 pt image.
+                TimelineView(.animation(minimumInterval: 1 / 20)) { ctx in
+                    let t = ctx.date.timeIntervalSinceReferenceDate
+                    Image(nsImage: SparkIcon.image(fill: fill, angle: (t * 60).truncatingRemainder(dividingBy: 360),
+                                                   scale: 0.9 + 0.1 * (0.5 + 0.5 * sin(t * 4))))
                 }
+            } else {
+                Image(nsImage: SparkIcon.cached(fill: fill))
+            }
+            if let text = state.menuBarText {
+                Text(text).font(.system(size: 12, weight: .medium).monospacedDigit())
             }
         }
     }

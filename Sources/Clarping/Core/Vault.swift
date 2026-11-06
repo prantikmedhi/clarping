@@ -31,7 +31,15 @@ final class Vault {
     func loadSwitchLog() -> [SwitchLogEntry] { read([SwitchLogEntry].self, paths.switchLogFile) ?? [] }
     func saveSwitchLog(_ l: [SwitchLogEntry]) { write(l, paths.switchLogFile) }
     func loadTokenStats() -> TokenStats { read(TokenStats.self, paths.tokenStatsFile) ?? TokenStats() }
-    func saveTokenStats(_ t: TokenStats) { write(t, paths.tokenStatsFile) }
+    /// Machine-only and megabytes large (one id per counted message): written
+    /// compact, not pretty-printed.
+    func saveTokenStats(_ t: TokenStats) {
+        guard let d = try? compactEncoder.encode(t) else { return }
+        try? Vault.atomicWrite(d, to: paths.tokenStatsFile, mode: 0o600)
+    }
+    private let compactEncoder: JSONEncoder = {
+        let e = JSONEncoder(); e.dateEncodingStrategy = .iso8601; e.outputFormatting = [.sortedKeys]; return e
+    }()
 
     private func read<T: Decodable>(_ type: T.Type, _ url: URL) -> T? {
         guard let d = try? Data(contentsOf: url) else { return nil }

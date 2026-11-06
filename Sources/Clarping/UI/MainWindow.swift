@@ -271,6 +271,7 @@ struct SettingsView: View {
                             .font(.system(size: 12)).foregroundStyle(Theme.inkSecondary).card()
                     }
                     ForEach(state.accounts) { a in AccountSettingsRow(account: a) }
+                    StatusLine()
                 }
                 VStack(alignment: .leading, spacing: 10) {
                     Text("Behavior").font(.system(size: 14, weight: .semibold, design: .serif)).foregroundStyle(Theme.ink)
@@ -339,7 +340,8 @@ struct AccountSettingsRow: View {
             Spacer()
             if account.id == state.activeId {
                 Text("active").font(.system(size: 10.5, weight: .medium)).foregroundStyle(Theme.clayDeep)
-                Button("Re-capture") { state.recapture(account) }.buttonStyle(QuietButtonStyle())
+                Button("Re-capture") { state.recapture(account) }.buttonStyle(QuietButtonStyle()).disabled(state.adding)
+                    .help(state.settings.switchDesktop ? "Re-reads the login; quits and relaunches Claude Desktop to copy its login" : "Re-reads the login Claude Code holds now")
             }
             if local.value.confirmRemove {
                 Button("Cancel") { local.value.confirmRemove = false }.buttonStyle(QuietButtonStyle())

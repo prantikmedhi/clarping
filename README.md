@@ -27,13 +27,13 @@ open build/Clarping.app
 Useful flags:
 
 ```sh
-build/Clarping.app/Contents/MacOS/Clarping --add-current             # capture the active login headlessly
+build/Clarping.app/Contents/MacOS/Clarping --add-current             # link the active login headlessly (exit 3 if already linked; --relink re-captures)
 build/Clarping.app/Contents/MacOS/Clarping --dry-run-selftest /tmp/h  # exercise capture -> switch -> verify against fake files
 ```
 
 ## How linking works
 
-"Add account" (or `--add-current`) reads the login that is active right now and stores it in Clarping's vault. Before anything is stored, the keychain token is checked against the profile endpoint: it must belong to the account named in `~/.claude.json`, otherwise the capture is refused (a stale `claude` process writing an old login back can therefore never overwrite another account's copy). Nothing of Claude's is modified by this step, except that with Desktop switching enabled, Claude Desktop is quit for the copy and relaunched (its SQLite and LevelDB files cannot be copied safely while it runs; with the setting off and Desktop running, the Desktop login is skipped and a note says so). If Desktop is signed in as a different account than the CLI, its login is not filed under the CLI account; sign Desktop into the same account and re-capture. To link a second account: sign out and in with `claude` (and in Claude Desktop, if you use it), then press "Add account" again.
+"Add account" (or `--add-current`) reads the login that is active right now and stores it in Clarping's vault. Before anything is stored, the keychain token is checked against the profile endpoint: it must belong to the account named in `~/.claude.json`, otherwise the capture is refused (a stale `claude` process writing an old login back can therefore never overwrite another account's copy). Nothing of Claude's is modified by this step. If the active login is already linked, "Add account" says so and does nothing else; sign in to another account with `claude /login` first. "Add account" never quits Claude Desktop: when Desktop is running its login is skipped and a note says so. "Re-capture" in Settings re-reads the active account and, with Desktop switching enabled, quits Claude Desktop for the copy and relaunches it (its SQLite and LevelDB files cannot be copied safely while it runs). If Desktop is signed in as a different account than the CLI, its login is not filed under the CLI account; sign Desktop into the same account and re-capture. To link a second account: sign out and in with `claude` (and in Claude Desktop, if you use it), then press "Add account" again.
 
 What is read:
 
