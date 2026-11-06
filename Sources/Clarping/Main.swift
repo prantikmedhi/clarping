@@ -12,15 +12,26 @@ enum Entry {
             // Headless capture of the active login into Clarping's vault (read-only w.r.t. Claude's files).
             let vault = Vault(paths: .real)
             var accounts = vault.loadAccounts()
-            do {
-                let a = try Switcher(paths: .real, vault: vault).captureCurrent(into: &accounts)
-                vault.saveAccounts(accounts)
-                print("captured \(a.label) (\(a.emailDomain))")
-                exit(0)
-            } catch {
-                print("failed: \(error.localizedDescription)")
-                exit(1)
+            let sw = Switcher(paths: .real, vault: vault)
+            sw.identityCheck = { try await ClaudeAPI.profile(token: $0).accountId }
+            var code: Int32 = 1
+            var done = false
+            // Detached: main() is main-actor bound and keeps the main run loop
+            // turning below (URLSession needs it in a headless process).
+            Task.detached {
+                do {
+                    let a = try await sw.captureCurrent(into: &accounts, desktop: .skipIfRunning)
+                    vault.saveAccounts(accounts)
+                    print("captured \(a.label) (\(a.emailDomain))")
+                    if let note = sw.lastCaptureNote { print("note: \(note)") }
+                    code = 0
+                } catch {
+                    print("failed: \(error.localizedDescription)")
+                }
+                done = true
             }
+            while !done { RunLoop.main.run(mode: .default, before: Date(timeIntervalSinceNow: 0.1)) }
+            exit(code)
         }
         ClarpingApp.main()
     }

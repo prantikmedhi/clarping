@@ -17,6 +17,8 @@ struct PopoverView: View {
             }
             if let err = state.switchError ?? state.errors["_add"] {
                 Text(err).font(.system(size: 11)).foregroundStyle(Theme.clayDeep).fixedSize(horizontal: false, vertical: true)
+            } else if let note = state.captureNote {
+                Text(note).font(.system(size: 11)).foregroundStyle(Theme.inkSecondary).fixedSize(horizontal: false, vertical: true)
             }
             footer
         }
@@ -119,12 +121,19 @@ struct AccountCard: View {
                 Text(step.rawValue).font(.system(size: 11, weight: .medium)).foregroundStyle(Theme.clayDeep).contentTransition(.opacity)
             }
             if isConfirming {
-                HStack {
-                    Text("Switch Claude Code\(state.settings.switchDesktop ? " and Desktop" : "") to \(account.label)?")
-                        .font(.system(size: 11)).foregroundStyle(Theme.ink)
-                    Spacer()
-                    Button("Cancel") { state.confirmTarget = nil }.buttonStyle(QuietButtonStyle())
-                    Button("Switch") { state.performSwitch(to: account) }.buttonStyle(QuietButtonStyle(prominent: true))
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text("Switch Claude Code\(state.settings.switchDesktop ? " and Desktop" : "") to \(account.label)?")
+                            .font(.system(size: 11)).foregroundStyle(Theme.ink)
+                        Spacer()
+                        Button("Cancel") { state.confirmTarget = nil }.buttonStyle(QuietButtonStyle())
+                        Button("Switch") { state.performSwitch(to: account) }.buttonStyle(QuietButtonStyle(prominent: true))
+                    }
+                    let running = state.runningCLICount
+                    if running > 0 {
+                        Text("\(running) `claude` session\(running == 1 ? " is" : "s are") running: they keep the old login until restarted and may write ~/.claude.json during the switch.")
+                            .font(.system(size: 10.5)).foregroundStyle(Theme.clayDeep).fixedSize(horizontal: false, vertical: true)
+                    }
                 }
                 .padding(.top, 2)
             }

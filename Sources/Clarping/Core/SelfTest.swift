@@ -7,6 +7,18 @@ enum SelfTest {
     struct Failure: Error { let msg: String }
 
     static func run(home: URL) -> Int32 {
+        // The temp HOME is deleted at the end, so it must be a fresh path: never
+        // the real home, and never an existing non-empty directory.
+        let real = FileManager.default.homeDirectoryForCurrentUser.standardizedFileURL.path
+        let target = home.standardizedFileURL.path
+        if target == real || real.hasPrefix(target + "/") || target == "/" {
+            print("FAIL  refusing to use \(target) as the self-test HOME")
+            return 2
+        }
+        if let existing = try? FileManager.default.contentsOfDirectory(atPath: target), !existing.isEmpty {
+            print("FAIL  \(target) exists and is not empty; pass a new path")
+            return 2
+        }
         var failures = 0
         func check(_ name: String, _ cond: @autoclosure () throws -> Bool) {
             let ok = (try? cond()) ?? false
@@ -19,7 +31,7 @@ enum SelfTest {
         defer {
             Vault(paths: paths).deleteAllSecrets(ids: ids)
             try? Keychain.delete(service: paths.cliService, account: paths.cliAccount)
-            try? fm.removeItem(at: home)
+            try? fm.removeItem(at: home)   // only ever the empty/new directory checked above
             print("cleaned up temp HOME and test keychain items")
         }
 
@@ -51,7 +63,16 @@ enum SelfTest {
             var accounts = vault.loadAccounts()
 
             // 1. capture A
-            let a = try sw.captureCurrent(into: &accounts)
+            var captured: Account?
+            var capErr: Error?
+            let sem0 = DispatchSemaphore(value: 0)
+            Task {
+                do { captured = try await sw.captureCurrent(into: &accounts, desktop: .alreadyQuiet) } catch { capErr = error }
+                sem0.signal()
+            }
+            sem0.wait()
+            if let capErr { throw capErr }
+            let a = captured!
             vault.saveAccounts(accounts)
             check("capture: account id from oauthAccount", a.id == ids[0])
             check("capture: label/email/org read", a.label == "Alpha" && a.email == "alpha@example.com" && a.orgName == "Alpha Org")
@@ -139,6 +160,31 @@ enum SelfTest {
             check("rollback: oauthAccount restored to A", (try sw.readClaudeJSON()["oauthAccount"] as? [String: Any])?["accountUuid"] as? String == ids[0])
             check("rollback: corrupt config.json left untouched", (try? String(contentsOf: paths.desktopConfig)) == "not json")
             try JSONSerialization.data(withJSONObject: dcfgA).write(to: paths.desktopConfig)
+
+            // 4c. a failure midway through the Desktop file restore puts the
+            // previous Desktop files back too. B's snapshot gains an IndexedDB
+            // entry whose live parent is a plain file, so the copy fails after
+            // Cookies have already been replaced.
+            let idb = "IndexedDB/https_claude.ai_0.indexeddb.leveldb"
+            try fm.createDirectory(at: bDir.appendingPathComponent(idb), withIntermediateDirectories: true)
+            try Data("idb-B".utf8).write(to: bDir.appendingPathComponent(idb + "/CURRENT"))
+            try fm.removeItem(at: paths.desktopDir.appendingPathComponent("IndexedDB"))
+            try Data("blocker".utf8).write(to: paths.desktopDir.appendingPathComponent("IndexedDB"))
+            var err4: Error?
+            let sem4 = DispatchSemaphore(value: 0)
+            Task {
+                do { try await sw.switchTo(bAcc, accounts: &accounts, includeDesktop: true) { _ in } } catch { err4 = error }
+                sem4.signal()
+            }
+            sem4.wait()
+            check("rollback: mid-restore Desktop failure makes the switch fail", err4 != nil)
+            check("rollback: Desktop cookies restored to A", (try? String(contentsOf: paths.desktopDir.appendingPathComponent("Cookies"))) == "cookies-A")
+            check("rollback: Desktop Local Storage restored to A", (try? String(contentsOf: paths.desktopDir.appendingPathComponent("Local Storage/leveldb/000.log"))) == "ls-A")
+            check("rollback: keychain still A", (try sw.readCLIItem()["claudeAiOauth"] as? [String: Any])?["accessToken"] as? String == "fake-at-A")
+            let desktopBackups = (try? fm.contentsOfDirectory(atPath: paths.backups.path))?.filter { $0.hasSuffix("-desktop") } ?? []
+            check("rollback: Desktop file backup folder written", !desktopBackups.isEmpty)
+            try fm.removeItem(at: paths.desktopDir.appendingPathComponent("IndexedDB"))
+            try fm.removeItem(at: bDir.appendingPathComponent("IndexedDB"))
 
             // 5. token ingest on a fake session log
             let proj = paths.claudeProjects.appendingPathComponent("p")

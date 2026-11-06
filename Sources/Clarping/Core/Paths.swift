@@ -9,6 +9,9 @@ struct Paths {
     /// Keychain item that Claude Code reads its login from.
     var cliService: String
     var cliAccount: String
+    /// Read the CLI item through `/usr/bin/security` (the tool that created it,
+    /// so no ACL prompt). false in the self-test, where Clarping creates the item.
+    var cliReadViaTool: Bool
     /// Keychain service Clarping stores its own vault under.
     var vaultService: String
     /// Bundle id of Claude Desktop. nil means never quit or relaunch anything.
@@ -48,6 +51,7 @@ struct Paths {
             appSupport: home.appendingPathComponent("Library/Application Support/Clarping"),
             cliService: "Claude Code-credentials",
             cliAccount: NSUserName(),
+            cliReadViaTool: true,
             vaultService: "Clarping",
             desktopBundleID: "com.anthropic.claudefordesktop"
         )
@@ -59,6 +63,7 @@ struct Paths {
             appSupport: home.appendingPathComponent("Library/Application Support/Clarping"),
             cliService: "Clarping-Test-CLI",
             cliAccount: "clarping-selftest",
+            cliReadViaTool: false,
             vaultService: "Clarping-Test",
             desktopBundleID: nil
         )

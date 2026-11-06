@@ -28,12 +28,17 @@ final class AppState: ObservableObject {
 
     private var pollTask: Task<Void, Never>?
     private var ingesting = false
+    /// Accounts whose stored token is being refreshed right now. A switch to
+    /// one of them waits; a refresh never persists over a newer vault entry.
+    private var refreshing: Set<String> = []
+    @Published var captureNote: String?
     static var isBundled: Bool { Bundle.main.bundleURL.pathExtension == "app" }
 
     init(paths: Paths) {
         self.paths = paths
         vault = Vault(paths: paths)
         switcher = Switcher(paths: paths, vault: vault)
+        switcher.identityCheck = { try await ClaudeAPI.profile(token: $0).accountId }
         settings = vault.loadSettings()
         accounts = vault.loadAccounts()
         snapshots = vault.loadSnapshots()
@@ -52,20 +57,33 @@ final class AppState: ObservableObject {
 
     // MARK: Accounts
 
+    /// Captures the active login. With Desktop switching enabled, Desktop is
+    /// quit for the copy and relaunched (its files cannot be copied while it runs).
     func addCurrentAccount() {
-        do {
-            var list = accounts
-            let a = try switcher.captureCurrent(into: &list)
-            accounts = list
-            vault.saveAccounts(accounts)
-            activeId = a.id
-            errors[a.id] = nil
-            Task { await poll(account: a) }
-            ingestTokens()
-        } catch {
-            errors["_add"] = error.localizedDescription
+        guard switchingTo == nil, !polling else { errors["_add"] = "Busy; try again in a moment"; return }
+        errors["_add"] = nil
+        captureNote = nil
+        let policy: Switcher.DesktopPolicy = settings.switchDesktop ? .quitIfRunning : .skipIfRunning
+        Task {
+            do {
+                var list = accounts
+                let a = try await switcher.captureCurrent(into: &list, desktop: policy)
+                accounts = list
+                vault.saveAccounts(accounts)
+                activeId = a.id
+                errors[a.id] = nil
+                captureNote = switcher.lastCaptureNote
+                await poll(account: a)
+                ingestTokens()
+            } catch {
+                errors["_add"] = error.localizedDescription
+            }
         }
     }
+
+    /// `claude` processes running right now; shown before a switch because they
+    /// keep the old login and can write ~/.claude.json concurrently.
+    var runningCLICount: Int { Switcher.runningCLICount() }
 
     func update(_ account: Account) {
         guard let i = accounts.firstIndex(where: { $0.id == account.id }) else { return }
@@ -139,9 +157,19 @@ final class AppState: ObservableObject {
             } else {
                 guard let stored = try vault.cliCreds(for: account.id) else { throw SwitchError(message: "No stored login") }
                 creds = stored
-                if let exp = creds.expiresAt, exp < Date().addingTimeInterval(60) {
-                    creds = try await ClaudeAPI.refresh(creds)
-                    try vault.saveCLICreds(creds, for: account.id)
+                // Only refresh once the access token is actually expired: a `claude`
+                // session of that account may still hold the same refresh token, and
+                // every refresh rotates it for whoever refreshes first.
+                if let exp = creds.expiresAt, exp < Date(), !refreshing.contains(account.id) {
+                    refreshing.insert(account.id)
+                    defer { refreshing.remove(account.id) }
+                    let fresh = try await ClaudeAPI.refresh(creds)
+                    // Persist only if nothing else (a switch, a re-capture) replaced the
+                    // vault entry while the request was in flight.
+                    let now = try vault.cliCreds(for: account.id)
+                    guard switchingTo == nil, now?.refreshToken == stored.refreshToken else { return }
+                    try vault.saveCLICreds(fresh, for: account.id)
+                    creds = fresh
                 }
             }
             guard let token = creds.accessToken else { throw APIError.reloginNeeded }
@@ -154,6 +182,11 @@ final class AppState: ObservableObject {
             a.needsRelogin = true
             update(a)
             errors[account.id] = account.id == activeId ? "Token expired. Run `claude` once to refresh." : "Re-login needed"
+        } catch APIError.recaptureNeeded {
+            var a = account
+            a.needsRelogin = true
+            update(a)
+            errors[account.id] = "Stored login was rotated elsewhere. Make it active with `claude /login`, then re-capture."
         } catch {
             errors[account.id] = error.localizedDescription
         }
@@ -225,6 +258,8 @@ final class AppState: ObservableObject {
         switchError = nil
         let from = activeId
         Task {
+            // A refresh of the target may be in flight; let it finish or give up.
+            for _ in 0..<100 where refreshing.contains(account.id) { try? await Task.sleep(nanoseconds: 200_000_000) }
             var list = accounts
             do {
                 try await switcher.switchTo(account, accounts: &list, includeDesktop: settings.switchDesktop) { step in
@@ -269,10 +304,11 @@ final class AppState: ObservableObject {
         Task.detached(priority: .utility) { [weak self] in
             var result = input
             TokenIngest.ingest(stats: &result, projects: projects, attribute: attribute)
-            await MainActor.run {
+            let final = result
+            await MainActor.run { [weak self] in
                 guard let self else { return }
-                self.tokenStats = result
-                self.vault.saveTokenStats(result)
+                self.tokenStats = final
+                self.vault.saveTokenStats(final)
                 self.ingesting = false
             }
         }

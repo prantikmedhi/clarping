@@ -2,12 +2,17 @@ import Foundation
 
 enum APIError: LocalizedError {
     case reloginNeeded
+    /// The stored refresh token was rejected: it was rotated or revoked elsewhere
+    /// (typically a `claude` session of that account refreshed it). The account
+    /// must be made active with `claude /login` and re-captured.
+    case recaptureNeeded
     case http(Int)
     case malformed
 
     var errorDescription: String? {
         switch self {
         case .reloginNeeded: return "Re-login needed"
+        case .recaptureNeeded: return "Stored login was rotated elsewhere; re-capture it"
         case .http(let c): return "HTTP \(c)"
         case .malformed: return "Unexpected response"
         }
@@ -56,7 +61,7 @@ enum ClaudeAPI {
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
         let (data, resp) = try await URLSession.shared.data(for: req)
         let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
-        if code == 400 || code == 401 { throw APIError.reloginNeeded }
+        if code == 400 || code == 401 { throw APIError.recaptureNeeded }
         guard (200..<300).contains(code) else { throw APIError.http(code) }
         guard let o = try JSONSerialization.jsonObject(with: data) as? [String: Any], let at = o["access_token"] as? String else { throw APIError.malformed }
         var raw = creds.raw

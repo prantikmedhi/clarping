@@ -16,6 +16,8 @@ final class Vault {
         for dir in [paths.appSupport, paths.backups, paths.desktopSnapshots] {
             try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         }
+        Vault.excludeFromBackup(paths.backups)
+        Vault.excludeFromBackup(paths.desktopSnapshots)
     }
 
     // MARK: JSON files
@@ -41,15 +43,45 @@ final class Vault {
         try? Vault.atomicWrite(d, to: url, mode: 0o600)
     }
 
-    /// Temp file in the same directory, then rename over the target.
+    /// Temp file next to the (symlink-resolved) target, fsync, then rename over it.
     static func atomicWrite(_ data: Data, to url: URL, mode: Int = 0o600) throws {
-        let tmp = url.deletingLastPathComponent().appendingPathComponent(".\(url.lastPathComponent).\(UUID().uuidString).tmp")
-        guard FileManager.default.createFile(atPath: tmp.path, contents: data, attributes: [.posixPermissions: mode]) else {
+        let target = url.resolvingSymlinksInPath()
+        let tmp = target.deletingLastPathComponent().appendingPathComponent(".\(target.lastPathComponent).\(UUID().uuidString).tmp")
+        guard FileManager.default.createFile(atPath: tmp.path, contents: nil, attributes: [.posixPermissions: mode]),
+              let fh = try? FileHandle(forWritingTo: tmp) else {
             throw KeychainError(message: "could not create \(tmp.lastPathComponent)")
         }
-        if rename(tmp.path, url.path) != 0 {
+        do {
+            try fh.write(contentsOf: data)
+            try fh.synchronize()
+            try fh.close()
+        } catch {
             try? FileManager.default.removeItem(at: tmp)
-            throw KeychainError(message: "rename failed for \(url.lastPathComponent): \(String(cString: strerror(errno)))")
+            throw error
+        }
+        if rename(tmp.path, target.path) != 0 {
+            try? FileManager.default.removeItem(at: tmp)
+            throw KeychainError(message: "rename failed for \(target.lastPathComponent): \(String(cString: strerror(errno)))")
+        }
+    }
+
+    /// Keeps a folder out of Time Machine (snapshots hold encrypted login state).
+    static func excludeFromBackup(_ dir: URL) {
+        var u = dir
+        var v = URLResourceValues(); v.isExcludedFromBackup = true
+        try? u.setResourceValues(v)
+    }
+
+    /// 0700 for directories, 0600 for files, recursively.
+    static func tightenModes(_ root: URL) {
+        let fm = FileManager.default
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: root.path, isDirectory: &isDir) else { return }
+        try? fm.setAttributes([.posixPermissions: isDir.boolValue ? 0o700 : 0o600], ofItemAtPath: root.path)
+        guard isDir.boolValue, let e = fm.enumerator(at: root, includingPropertiesForKeys: [.isDirectoryKey]) else { return }
+        for case let u as URL in e {
+            let d = (try? u.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
+            try? fm.setAttributes([.posixPermissions: d ? 0o700 : 0o600], ofItemAtPath: u.path)
         }
     }
 
@@ -70,7 +102,7 @@ final class Vault {
         let d = try JSONSerialization.data(withJSONObject: keys, options: [.sortedKeys])
         try Keychain.write(service: paths.vaultService, account: "\(id):desktop-config", data: d)
     }
-    /// Secret-bearing backup of the whole CLI keychain item, kept in the keychain (never on disk).
+    /// Backup of the whole CLI keychain item, kept in the keychain.
     func saveCLIBackup(_ data: Data) throws {
         try Keychain.write(service: paths.vaultService, account: "backup:cli-latest", data: data)
     }

@@ -19,7 +19,9 @@ struct FileCursor: Codable, Equatable {
 struct TokenStats: Codable, Equatable {
     var cursors: [String: FileCursor] = [:]
     var buckets: [String: TokenBucket] = [:]
-    var seen: [String] = []
+    /// Message ids already counted, grouped by day so old days can be dropped
+    /// without ever double-counting a replayed line inside the window.
+    var seenByDay: [String: [String]] = [:]
     var lastIngest: Date?
 
     static let unattributed = "unattributed"
@@ -116,13 +118,17 @@ enum TokenIngest {
         let fm = FileManager.default
         guard let e = fm.enumerator(at: projects, includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey, .isRegularFileKey]) else { return }
         let cutoff = Date().addingTimeInterval(-Double(windowDays) * 86400)
-        var seen = Set(stats.seen)
+        let cutoffDay = DayKey.of(cutoff)
+        stats.seenByDay = stats.seenByDay.filter { $0.key >= cutoffDay }
+        var seen: [String: Set<String>] = stats.seenByDay.mapValues(Set.init)
         var touched = false
+        var present: Set<String> = []
         while let url = e.nextObject() as? URL {
             guard url.pathExtension == "jsonl",
                   let rv = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey, .isRegularFileKey]),
                   rv.isRegularFile == true, let size = rv.fileSize, let mod = rv.contentModificationDate, mod >= cutoff else { continue }
             let key = url.path
+            present.insert(key)
             var cursor = stats.cursors[key] ?? FileCursor(offset: 0, size: 0)
             if size < cursor.offset { cursor = FileCursor(offset: 0, size: 0) }
             guard size > cursor.offset, let fh = try? FileHandle(forReadingFrom: url) else { continue }
@@ -140,42 +146,47 @@ enum TokenIngest {
             stats.cursors[key] = FileCursor(offset: cursor.offset + consumed, size: size)
             touched = true
         }
+        // Cursors for files that no longer exist (or fell out of the window) are dropped.
+        stats.cursors = stats.cursors.filter { present.contains($0.key) }
         if touched {
-            if seen.count > 400_000 { seen.removeAll() }
-            stats.seen = Array(seen)
+            stats.seenByDay = seen.mapValues(Array.init)
             stats.lastIngest = Date()
         }
     }
 
-    private static func fold(line: Data, into stats: inout TokenStats, seen: inout Set<String>, attribute: (Date) -> String) {
+    private static func fold(line: Data, into stats: inout TokenStats, seen: inout [String: Set<String>], attribute: (Date) -> String) {
         guard let o = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
               o["type"] as? String == "assistant",
               let msg = o["message"] as? [String: Any],
-              let usage = msg["usage"] as? [String: Any] else { return }
-        let id = (msg["id"] as? String ?? "") + ":" + (o["requestId"] as? String ?? "")
-        if id != ":" {
-            if seen.contains(id) { return }
-            seen.insert(id)
-        }
-        guard let ts = (o["timestamp"] as? String).flatMap(Format.parseISO) else { return }
+              let usage = msg["usage"] as? [String: Any],
+              let tsString = o["timestamp"] as? String, let ts = Format.parseISO(tsString) else { return }
         let b = TokenBucket(input: usage["input_tokens"] as? Int ?? 0, output: usage["output_tokens"] as? Int ?? 0,
                             cacheRead: usage["cache_read_input_tokens"] as? Int ?? 0, cacheWrite: usage["cache_creation_input_tokens"] as? Int ?? 0)
         guard b.total > 0 else { return }
-        let key = TokenStats.key(day: DayKey.of(ts), account: attribute(ts), family: Pricing.family(of: msg["model"] as? String ?? ""))
+        let model = msg["model"] as? String ?? ""
+        let day = DayKey.of(ts)
+        // Lines without ids still get a stable identity from their own content.
+        var id = (msg["id"] as? String ?? "") + ":" + (o["requestId"] as? String ?? "")
+        if id == ":" { id = "\(tsString)|\(model)|\(b.input)|\(b.output)|\(b.cacheRead)|\(b.cacheWrite)" }
+        if seen[day, default: []].contains(id) { return }
+        seen[day, default: []].insert(id)
+        let key = TokenStats.key(day: day, account: attribute(ts), family: Pricing.family(of: model))
         stats.buckets[key, default: TokenBucket()] = stats.buckets[key, default: TokenBucket()] + b
     }
 
     /// Account active at `date` according to the switch log. With no switches at
-    /// all, everything belongs to the single current account (if any).
+    /// all, everything belongs to the single current account (if any). Before the
+    /// first recorded switch, the account that switch came *from* was active.
     static func attributor(log: [SwitchLogEntry], activeId: String?) -> (Date) -> String {
         let entries = log.filter(\.ok).sorted { $0.at < $1.at }
         if entries.isEmpty { return { _ in activeId ?? TokenStats.unattributed } }
+        let before = entries.first?.fromId ?? TokenStats.unattributed
         return { date in
             var current: String? = nil
             for e in entries {
                 if e.at <= date { current = e.toId } else { break }
             }
-            return current ?? TokenStats.unattributed
+            return current ?? before
         }
     }
 }
