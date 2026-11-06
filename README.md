@@ -1,106 +1,205 @@
+<img src="assets/brand/icon-1024.png" width="96" alt="Clarping app icon">
+
 # Clarping
 
-A native macOS menu bar app that keeps several Claude accounts linked on one Mac, shows their rate-limit usage, and switches the login that Claude Code (and optionally Claude Desktop) uses.
+Clarping is a macOS menu bar app that switches the Claude account used by Claude Code (the `claude` CLI) and Claude Desktop, both at once. I'm on a Max plan, I hit the 5-hour limit often, and I keep a second account for when that happens. Signing out and back in to both apps every time got old, so Clarping does it in one click. Only the login is swapped. Projects, sessions, MCP servers and settings stay as they are.
 
-![Popover](docs/screenshots/popover.png)
+The menu bar popover also shows each linked account's 5-hour, weekly and Fable limits with their reset times and a plan badge (Max 5x, Max 20x, Pro). A dashboard counts tokens per account, model and day from Claude Code's local logs.
 
-## What it does
+The name is "larp" plus "clauding".
 
-- **Menu bar**: a four-point spark glyph with a thin arc showing the active account's 5-hour utilization, plus compact text such as `42% · 1h 12m` (toggle in Settings). While a switch is in progress the spark turns and pulses (a layer animation; Reduce Motion disables the pulse). The status item and popover are AppKit (`NSStatusItem` + `NSPopover`); the popover content is SwiftUI.
-- **Popover**: one card per linked account with its plan badge ("Max 5x", "Pro", derived from the login's rate-limit tier), liquid gauges for the 5-hour window, the weekly window and any per-model weekly limit the API reports (for example Fable), reset times, and a burn-rate projection for the active account. Click another card, confirm, and Clarping switches to it. Progress and errors ("Re-login needed") show inline. Cards and buttons use the system Liquid Glass material on macOS 26 and later and fall back to solid cream (also with Reduce Transparency on); every animation is a single settle spring on a state change.
-- **Setup guide**: a seven-step first-run window (sign in to Claude Code, Claude Desktop, add accounts, the keychain prompt, switching, launch at login) with live checks of what `claude` and Desktop are signed in as. Shown once; reopen it from Settings.
-- **Dashboard** (Open Clarping, or Cmd-, for Settings): tokens by account and by model family for today / this week / this month / last month, a 30-day daily chart, a 24-hour chart of the active account's limits, and the switch history. Data comes from Claude Code's own session logs.
-- **Poller**: every N minutes (default 3) it fetches usage for every linked account, refreshes stored tokens of inactive accounts when they are about to expire, posts notifications when a limit crosses 80% or 95%, and highlights the least-used account when the active one reaches 95%.
+Clarping is not made by or affiliated with Anthropic. It depends on undocumented files and endpoints; see [Limitations](#limitations).
 
-![Dashboard](docs/screenshots/dashboard.png)
+<img src="docs/screenshots/popover.png" width="344" alt="Clarping popover with two linked accounts and their limits">
+
+## Requirements
+
+- macOS 14 (Sonoma) or later. On macOS 26 and later the UI uses Liquid Glass; earlier versions get a solid fallback.
+- Swift 5.9 or later. The Xcode Command Line Tools are enough (`xcode-select --install`); you don't need Xcode.
+- Claude Code, signed in at least once with `claude /login`. Claude Desktop is optional.
 
 ## Build and install
 
-Requirements: macOS 14 or later, Swift 5.9+ (Command Line Tools are enough; no Xcode needed).
+From the repository root:
 
 ```sh
-scripts/build-app.sh          # swift build -c release, then assembles build/Clarping.app
+scripts/build-app.sh
 open build/Clarping.app
 ```
 
-`scripts/make-icon.sh` draws the app icon in code and packages it as `.icns`; `build-app.sh` runs it when the icon is missing. The bundle is ad-hoc signed (`codesign -s -`). Copy `build/Clarping.app` to `/Applications` if you want "Launch at login" to work reliably.
+`build-app.sh` runs `swift build -c release`, assembles `build/Clarping.app`, draws the icon with `scripts/make-icon.sh` if it isn't built yet, and ad-hoc signs the bundle.
 
-Useful flags:
+To keep it, copy it to `/Applications`. Launch at login works more reliably from there.
 
 ```sh
-build/Clarping.app/Contents/MacOS/Clarping --add-current             # link the active login headlessly (exit 3 if already linked; --relink re-captures)
-build/Clarping.app/Contents/MacOS/Clarping --dry-run-selftest /tmp/h  # exercise capture -> switch -> verify against fake files
+cp -R build/Clarping.app /Applications/
 ```
 
-Debug environment hooks (see `Main.swift`): `CLARPING_DEBUG_OPEN_POPOVER`, `CLARPING_DEBUG_CONFIRM`, `CLARPING_DEBUG_DRY_SWITCH`, `CLARPING_DEBUG_POLL_AT`, `CLARPING_DEBUG_SHOW`, `CLARPING_DEBUG_ONBOARDING`, `CLARPING_DEBUG_SHOT=<dir>` (writes the PNGs in `docs/screenshots/`), `CLARPING_DEBUG_FLAT=1` (renders the solid fallback; `cacheDisplay` cannot capture system glass) and `CLARPING_DEBUG_NO_POLL=1`.
+Clarping has no Dock icon. Look for the spark in the menu bar. On first launch it opens a seven-step setup guide that checks what `claude` and Claude Desktop are signed in as. You can reopen the guide from Settings.
 
-## How linking works
+## Setup
 
-"Add account" (or `--add-current`) reads the login that is active right now and stores it in Clarping's vault. Before anything is stored, the keychain token is checked against the profile endpoint: it must belong to the account named in `~/.claude.json`, otherwise the capture is refused (a stale `claude` process writing an old login back can therefore never overwrite another account's copy). Nothing of Claude's is modified by this step. If the active login is already linked, "Add account" says so and does nothing else; sign in to another account with `claude /login` first. "Add account" never quits Claude Desktop: when Desktop is running its login is skipped and a note says so. "Re-capture" in Settings re-reads the active account and, with Desktop switching enabled, quits Claude Desktop for the copy and relaunches it (its SQLite and LevelDB files cannot be copied safely while it runs). If Desktop is signed in as a different account than the CLI, its login is not filed under the CLI account; sign Desktop into the same account and re-capture. To link a second account: sign out and in with `claude`, then press "Add account" again. Do not use "Log out" in Claude Desktop for an account Clarping has captured: logging out revokes that session on the server, so its saved snapshot can only restore to the sign-in screen. Snapshots are only taken while Desktop holds a live claude.ai session cookie, and every Desktop switch first files Desktop's live login under the linked account its `config.json` names.
+Link each account once. Clarping reads the login that is active right now, checks the token against Anthropic's profile endpoint, and stores a copy. Linking changes nothing of Claude's.
 
-What is read:
+### Claude Code CLI
 
-| Source | What is taken |
-| --- | --- |
-| Keychain item `Claude Code-credentials` (account = your user name) | only the `claudeAiOauth` block |
-| `~/.claude.json` | only the `oauthAccount` block |
-| `~/Library/Application Support/Claude/` | `Cookies`, `Cookies-journal`, `Local Storage`, `Session Storage`, `IndexedDB/https_claude.ai_0.indexeddb.leveldb`, `IndexedDB/https_claude.ai_0.indexeddb.blob` |
-| `~/Library/Application Support/Claude/config.json` | only the keys `oauth:tokenCache`, `oauth:tokenCacheV2`, `lastKnownAccountUuid`, `bootSideSessions` |
+1. In Terminal, run `claude /login` and sign in with account A.
+2. In the Clarping popover, click Add account.
+3. Run `claude /login` again with account B, then click Add account again.
+4. Repeat for any further accounts.
 
-Where it goes:
+If Add says the account is already linked, `claude` is still signed in to that account. Sign in to a different one first.
 
-| Vault location | Contents |
-| --- | --- |
-| Keychain service `Clarping`, account `<accountId>:cli` | the `claudeAiOauth` JSON |
-| Keychain service `Clarping`, account `<accountId>:desktop-config` | the four Desktop config keys |
-| `~/Library/Application Support/Clarping/desktop/<accountId>/` (mode 0700) | copies of the Desktop auth files |
-| `~/Library/Application Support/Clarping/accounts.json` | label, color, email, org, the `oauthAccount` block (no secrets) |
-| `~/Library/Application Support/Clarping/*.json` | settings, usage snapshots, switch log, token statistics (no secrets) |
+What a switch changes for the CLI:
 
-## How switching works
+- The keychain item `Claude Code-credentials` (account: your macOS user name). Clarping replaces only its `claudeAiOauth` block and updates the item in place, so Claude Code keeps reading it without prompts. Other keys in the item, such as `mcpOAuth` with your MCP server logins, are kept.
+- In `~/.claude.json`, the `oauthAccount` block is replaced and four account-specific caches are dropped so they refresh (`cachedUsageUtilization`, `cachedArtifactRoster`, `passesEligibilityCache`, `overageCreditGrantCache`). Everything else in the file (`projects`, `mcpServers`, `userID` and so on) stays. Key order may change.
 
-1. If Claude Desktop is running and Desktop switching is on, quit it (AppleScript `quit`, then wait until the process is gone) so its files are quiescent.
-2. Re-capture the active account into the vault (refresh tokens rotate, so the vault must hold whatever the CLI holds now).
-3. Back up: `~/.claude.json` to `~/Library/Application Support/Clarping/backups/<timestamp>-claude.json` (0600, last 20 entries kept); the live Desktop auth files to `backups/<timestamp>-desktop/` (0700); the whole Claude Code keychain item and Desktop's login keys inside the keychain (`Clarping` / `backup:cli-latest` and `backup:desktop-config-latest`). The `backups/` and `desktop/` folders are excluded from Time Machine.
-4. Write the target's `claudeAiOauth` into the existing `Claude Code-credentials` item with `SecItemUpdate`, so the item keeps its access list. Every other key in that item, notably `mcpOAuth` with the MCP server logins, is preserved. If the item does not exist, the switch is refused (run `claude /login` once): an item created by Clarping would make the CLI prompt on every read. If the target is already the active CLI account, steps 4 and 5 are skipped (the live item is newer than the vault).
-5. Patch `~/.claude.json`: replace `oauthAccount`, drop the account-keyed caches `cachedUsageUtilization`, `cachedArtifactRoster`, `passesEligibilityCache`, `overageCreditGrantCache` so they refresh. Nothing else is touched (`userID`, `anonymousId`, `machineID`, `projects`, `mcpServers`, `providerProfiles` and the rest stay as they are; key order may change). Written atomically via a temp file and rename, keeping the original file mode.
-6. Restore the target's Desktop auth files and merge its four config keys into `config.json` at key level, then relaunch Desktop if it was running.
-7. Log the switch (used to attribute tokens in the dashboard).
+Nothing under `~/.claude/` is touched. Your projects, session history and settings are shared by all accounts.
 
-If anything fails after step 4, the keychain item, the `oauthAccount` block (re-applied onto the current file, so a CLI write made meanwhile survives) and the Desktop auth files are rolled back and Desktop is relaunched. Polling pauses while a switch runs, and a switch waits for any in-flight token refresh of its target. The confirm step warns when `claude` processes are running: they keep the old login until restarted and can write `~/.claude.json` during the switch.
+### Claude Desktop
 
-The active account is never token-refreshed by Clarping: its refresh token belongs to the CLI, and rotating it from outside would log the CLI out. Clarping reads the active login from the keychain on every poll and, before filing it under an account, confirms with the profile endpoint that the token really belongs to that account id.
+1. Sign in to Claude Desktop with the same account `claude` is signed in to.
+2. Quit Claude Desktop, then click Add account. Add never quits Desktop: if Desktop is running, Add links the CLI login only and tells you Desktop was skipped. You can also add first and then click Re-capture for that account in Settings, which quits Desktop, copies its login and reopens it.
+3. Repeat for each account.
 
-All file and keychain locations live in one `Paths` struct, so the self-test runs the real `Switcher` against a temporary HOME and the throwaway keychain services `Clarping-Test` / `Clarping-Test-CLI`, then cleans up.
+Clarping only saves a Desktop login while Desktop holds a live claude.ai session and reports the same account as the CLI. Otherwise it saves the CLI login alone and explains why.
+
+During a switch, Clarping quits Claude Desktop (if it is running), swaps its login files and reopens it. The first time, macOS asks whether Clarping may control Claude. Allow it, or find it later in System Settings > Privacy & Security > Automation.
+
+Files swapped, inside `~/Library/Application Support/Claude/`:
+
+- `Cookies` and `Cookies-journal`
+- `Local Storage` and `Session Storage`
+- `IndexedDB/https_claude.ai_0.indexeddb.leveldb` and `IndexedDB/https_claude.ai_0.indexeddb.blob`
+- In `config.json`, only the keys `oauth:tokenCache`, `oauth:tokenCacheV2`, `lastKnownAccountUuid` and `bootSideSessions`, merged at key level
+
+Everything else in that folder is left alone, including Code tab and Cowork sessions (`claude-code-sessions/`, `local-agent-mode-sessions/`), `scratch-workspaces/`, `vm_bundles/` and `claude_desktop_config.json`.
+
+Don't use Log out in Claude Desktop for an account Clarping has saved. Logging out revokes that session on the server, and the saved copy then restores to the sign-in screen. To fix it, sign in again and Re-capture.
+
+To switch only the CLI, turn off "Also switch Claude Desktop" in Settings. It is on by default.
+
+### The keychain prompt
+
+On the first real switch, macOS asks whether Clarping may use the `Claude Code-credentials` keychain item. Choose Always Allow. The build is ad-hoc signed, so each rebuild gives the app a new identity and the prompt comes back once.
+
+## Switching
+
+Click an account card in the popover, then click Switch. If any `claude` processes are running, the confirmation says how many. Restart them after the switch: a running session keeps the old login until it restarts, and it may write `~/.claude.json` while the switch runs.
+
+What happens, in order:
+
+1. If Desktop switching applies, Clarping asks Claude Desktop to quit (AppleScript) and waits until its helper processes are gone.
+2. It saves the current login back into its vault, because refresh tokens rotate and the vault needs the latest one. It also files Desktop's live login under the account Desktop reports.
+3. It makes backups (below).
+4. It writes the target account's `claudeAiOauth` into the `Claude Code-credentials` item.
+5. It patches `~/.claude.json` as described above, writing atomically and keeping the file's permissions.
+6. It restores the target's Desktop files and config keys, then reopens Desktop if it was running.
+7. It records the switch in its log, which the dashboard uses to attribute tokens.
+
+If a step after the backup fails, Clarping restores the previous keychain item, `oauthAccount` and Desktop files, reopens Desktop, and shows the error on the card. Polling pauses while a switch runs.
+
+Clarping never refreshes the active account's token. That refresh token belongs to the running CLI, and rotating it from outside would log the CLI out. Inactive accounts are refreshed from the vault only after their access token has expired.
+
+### Backups and manual restore
+
+Each switch writes, under `~/Library/Application Support/Clarping/backups/`:
+
+- `<timestamp>-claude.json`, a copy of `~/.claude.json` (mode 0600)
+- `<timestamp>-desktop/`, a copy of the Desktop login files, when Desktop is switched (mode 0700)
+
+The 20 newest entries in that folder are kept. A switch that includes Desktop writes two entries, so that is about 10 switches. The previous `Claude Code-credentials` item and Desktop config keys are saved in the keychain under service `Clarping`, accounts `backup:cli-latest` and `backup:desktop-config-latest`. Only the latest copy is kept.
+
+To restore by hand:
+
+- The simplest fix is to sign in again: `claude /login` for the CLI, and sign in inside Claude Desktop.
+- For `~/.claude.json`, copy the `oauthAccount` block from a backup into the current file with no `claude` running. Copying the whole file back also reverts any project state that changed since.
+- For Desktop, quit it, then copy the items from a `<timestamp>-desktop/` folder back into `~/Library/Application Support/Claude/`.
+
+## Dashboard and settings
+
+<img src="docs/screenshots/dashboard.png" width="560" alt="Clarping dashboard with token counts by account and model">
+
+Open Clarping from the popover to get the dashboard:
+
+- Input, output, cache read and cache write tokens by account and by model family (Opus, Sonnet, Fable, Haiku, Other) for today, this week, this month and last month
+- Daily tokens for the last 30 days
+- The active account's limits over the last 24 hours
+- Switch history
+
+Token data comes from Claude Code's session logs in `~/.claude/projects/` (the last 62 days, read incrementally, at most once a minute). The dashboard shows token counts only, not cost. Tokens are attributed using Clarping's switch log, so usage from before the first switch goes to the account that switch started from, or to the active account if you have never switched.
+
+Settings (Cmd-, or the gear in the popover) has the poll interval (default 3 minutes), usage text in the menu bar, notifications when a 5-hour or weekly limit crosses 80% or 95%, a hint pointing to the least-used account once the active one reaches 95%, Desktop switching, launch at login, and the setup guide. The account list lets you rename an account, pick its color, Re-capture the active one, or remove one. Removing an account deletes its keychain entries and Desktop copy.
+
+## Privacy and security
+
+- Login tokens are kept only in the macOS keychain, under service `Clarping`: `<accountId>:cli` holds the `claudeAiOauth` block and `<accountId>:desktop-config` holds the four Desktop config keys.
+- Secrets never go on a command line or into the environment. The `Claude Code-credentials` item is read with `security find-generic-password -w` over a pipe and written with `SecItemUpdate`.
+- `~/Library/Application Support/Clarping/` (mode 0700) holds `accounts.json` (label, color, email, organization, the `oauthAccount` block), `settings.json`, `usage-snapshots.json`, `switch-log.json` and `token-stats.json`, all mode 0600 with no tokens in them.
+- `desktop/<accountId>/` holds each account's copy of the Desktop login files, and `backups/` holds the backups. Both are 0700 with 0600 files and excluded from Time Machine. Desktop encrypts its cookie values with a key in this Mac's keychain; Clarping copies the files as they are. A `~/.claude.json` backup has no login tokens but can contain MCP server settings.
+- The only network requests go to Anthropic:
+  - `https://api.anthropic.com/api/oauth/usage` for limits
+  - `https://api.anthropic.com/api/oauth/profile` to confirm which account a token belongs to
+  - `https://platform.claude.com/v1/oauth/token` to refresh an inactive account's token
+- No telemetry, analytics or update checks. Notifications are local.
 
 ## Limitations
 
-- **Desktop cookies are machine-bound.** Claude Desktop encrypts cookie values with the `Claude Safe Storage` keychain key; Clarping copies the encrypted files as they are, so a vault only works on the Mac that captured it. Desktop also keeps caches of web state outside the copied files; if it looks confused after a switch, sign out and in once and re-capture.
-- **Claude Code caches the keychain read for about 30 seconds**, and a running `claude` session keeps using the token it already has until you restart it. Start new sessions after switching.
-- **Desktop's Code tab / Cowork** already keep their own per-account data; Clarping does not touch `claude-code-sessions/`, `local-agent-mode-sessions/`, `scratch-workspaces/`, `vm_bundles/` or `claude_desktop_config.json`.
-- **Token attribution** uses Clarping's own switch log, per message timestamp. Tokens logged before the first switch belong to the account that switch came from; with no switches at all they belong to the active account. Accounts since removed show as "Removed account".
-- **Refresh tokens rotate.** Clarping refreshes an inactive account only once its access token has actually expired, because a `claude` session of that account may still hold the same refresh token and whoever refreshes first invalidates the other. When the stored refresh token is rejected, the card says the login was rotated elsewhere: make that account active with `claude /login`, then re-capture it.
-- **Keychain access and prompts.** Secrets never appear on a command line or in the environment. Clarping's own items use Security.framework; the Claude Code item is read with `security find-generic-password -w` over a pipe (the tool that created it, so no prompt) and written with `SecItemUpdate`. That write shows one macOS keychain prompt for Clarping on the first real switch; choose "Always Allow". The app is ad-hoc signed, so a rebuild changes its identity and the prompt returns once.
-- **Backups and snapshots on disk.** `backups/<ts>-claude.json` holds no login tokens but can contain MCP server settings; `backups/<ts>-desktop/` and `desktop/<id>/` hold Desktop cookies and storage whose values Desktop already encrypted with its keychain key. All are mode 0600/0700 and excluded from Time Machine.
-- Built with the Command Line Tools toolchain only; `@State` is unavailable there (no SwiftUI macro plugin), so views keep local state in `@StateObject` boxes.
+- Clarping is unofficial. It relies on the format of Claude Code's keychain item, `~/.claude.json`, Claude Desktop's storage, and OAuth endpoints that Anthropic does not document. Any Claude Code or Desktop update can break it.
+- It calls those endpoints with Claude Code's public OAuth client ID and a `claude-cli` user agent string.
+- You are responsible for complying with Anthropic's terms for your accounts and plans. Check them before using more than one account this way.
+- Running `claude` sessions keep the old login until restarted. A `claude` process writing `~/.claude.json` at the exact moment of a switch can lose that write.
+- Desktop login copies only work on the Mac that made them, because Desktop's cookie encryption key lives in this Mac's keychain. If Desktop looks confused after a switch, sign out and in once (see the Log out warning above) and Re-capture.
+- Refresh tokens rotate. If a `claude` session of an inactive account refreshed its token first, the stored copy is rejected and the card says the login was rotated elsewhere. Make that account active with `claude /login` and Re-capture it.
+- The app is ad-hoc signed, so the keychain prompt returns after every rebuild.
+- Token attribution follows Clarping's switch log, so usage from a session that kept running on the old login after a switch is counted against the new account.
 
-## Repository layout
+## Troubleshooting
 
+Clarping freezes or uses a lot of CPU. Quit it with the power button in the popover, or with `killall Clarping` if the popover doesn't open. Please report it with your macOS version and what you were doing. A `sample Clarping 5 > clarping-sample.txt` taken while it is stuck helps.
+
+Keychain prompts keep appearing. Choose Always Allow, not Allow. After a rebuild one prompt is expected. If you clicked Deny, the switch fails and leaves everything as it was; switch again and allow it.
+
+Claude Desktop didn't switch. Check System Settings > Privacy & Security > Automation and allow Clarping to control Claude. Check that "Also switch Claude Desktop" is on and that the account shows "Desktop" in its Settings row. If it doesn't, sign Desktop in to that account, make it the active account and click Re-capture. "Claude Desktop did not quit in time" means Desktop or one of its helpers stayed open; quit it yourself and switch again.
+
+"Already linked" when adding. `claude` is still signed in to an account you already added. Run `claude /login` with another account first. To refresh the saved copy of the current account, use Re-capture in Settings.
+
+"No Claude Code keychain item exists". Run `claude /login` once. Clarping won't create that item itself, because one it creates would make Claude Code prompt on every read.
+
+"Re-login needed" or "Stored login was rotated elsewhere". Make that account active with `claude /login`, then Re-capture it.
+
+## Development
+
+```sh
+swift build                                  # debug build
+scripts/build-app.sh                         # release build and app bundle
+build/Clarping.app/Contents/MacOS/Clarping --dry-run-selftest /tmp/clarping-selftest
+build/Clarping.app/Contents/MacOS/Clarping --add-current [--relink]
 ```
-Package.swift
-Sources/Clarping/
-  Main.swift            entry point, CLI flags, window management
-  AppState.swift        observable state, poller, notifications, projections
-  Core/Paths.swift      every path and keychain service name (real vs. test)
-  Core/Keychain.swift   Security.framework wrapper (plus a piped `security` read for the CLI item)
-  Core/Models.swift     Account, CLICreds, UsageSnapshot, Settings, formatting
-  Core/Vault.swift      Clarping's own storage
-  Core/ClaudeAPI.swift  token refresh, usage, profile
-  Core/Switcher.swift   capture and switch flow
-  Core/TokenIngest.swift incremental JSONL ingestion
-  Core/SelfTest.swift   --dry-run-selftest
-  UI/                   popover, dashboard, settings, setup guide, gauges, menu bar glyph, theme (glass surfaces)
-scripts/build-app.sh    swift build + .app assembly + codesign
-scripts/make-icon.sh    code-drawn icon -> .icns
-docs/screenshots/
-```
+
+`--dry-run-selftest <dir>` runs the real capture, switch and rollback code against fake files in a temporary HOME and the throwaway keychain services `Clarping-Test` and `Clarping-Test-CLI`, prints PASS or FAIL per check, and deletes everything afterward. The directory must be new or empty and can't be your home folder.
+
+`--add-current` links the active login without the UI. It exits 3 if the account is already linked; `--relink` re-captures it instead. It never quits Claude Desktop.
+
+Debug environment variables, all off by default:
+
+| Variable | Effect |
+| --- | --- |
+| `CLARPING_DEBUG_OPEN_POPOVER=1` | Opens the popover 2 s after launch |
+| `CLARPING_DEBUG_CONFIRM=1` | Opens the switch confirmation on the first inactive account at 4 s (UI only) |
+| `CLARPING_DEBUG_DRY_SWITCH=1` | Shows the switch-in-progress state for 30 s from 6 s, without touching the keychain or files |
+| `CLARPING_DEBUG_POLL_AT=<s>` | Runs one real poll `<s>` seconds after launch |
+| `CLARPING_DEBUG_NO_POLL=1` | Skips automatic polling |
+| `CLARPING_DEBUG_SHOW=1` | Opens the dashboard window at launch |
+| `CLARPING_DEBUG_ONBOARDING=1` | Opens the setup guide at launch |
+| `CLARPING_DEBUG_SHOT=<dir>` | With `CLARPING_DEBUG_SHOW=1`, writes the PNGs in `docs/screenshots/` to `<dir>` |
+| `CLARPING_DEBUG_FLAT=1` | Draws the solid fallback instead of Liquid Glass (screenshots can't capture system glass) |
+| `CLARPING_DEBUG_CHANGES=1` | Logs view re-renders and publish rates to stderr |
+| `CLARPING_TRACE=1` | Logs switch and capture step names (never values) to stderr |
+
+All file paths and keychain names live in `Sources/Clarping/Core/Paths.swift`, which is how the self-test swaps in a temporary HOME. The switch flow is in `Core/Switcher.swift`, polling and app state in `AppState.swift`, and the views in `UI/`. The Command Line Tools toolchain has no SwiftUI macro plugin, so views keep local state in `@StateObject` boxes instead of `@State`.
+
+## License
+
+License: TBD
