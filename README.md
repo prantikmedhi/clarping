@@ -6,7 +6,7 @@ A native macOS menu bar app that keeps several Claude accounts linked on one Mac
 
 ## What it does
 
-- **Menu bar**: a four-point spark glyph with a thin arc showing the active account's 5-hour utilization, plus compact text such as `42% · 1h 12m` (toggle in Settings). The spark rotates and breathes while a switch is in progress; Reduce Motion disables that.
+- **Menu bar**: a four-point spark glyph with a thin arc showing the active account's 5-hour utilization, plus compact text such as `42% · 1h 12m` (toggle in Settings). While a switch is in progress the spark turns and pulses (a layer animation; Reduce Motion disables the pulse). The status item and popover are AppKit (`NSStatusItem` + `NSPopover`); the popover content is SwiftUI.
 - **Popover**: one card per linked account with soft gauges for the 5-hour window, the weekly window and any per-model weekly limit the API reports (for example Fable), reset times, and a burn-rate projection for the active account. Click another card, confirm, and Clarping switches to it. Progress and errors ("Re-login needed") show inline.
 - **Dashboard** (Open Clarping, or Cmd-, for Settings): tokens by account and by model family for today / this week / this month / last month, an approximate API-equivalent cost, a 30-day daily chart, a 24-hour chart of the active account's limits, and the switch history. Data comes from Claude Code's own session logs.
 - **Poller**: every N minutes (default 3) it fetches usage for every linked account, refreshes stored tokens of inactive accounts when they are about to expire, posts notifications when a limit crosses 80% or 95%, and highlights the least-used account when the active one reaches 95%.

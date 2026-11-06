@@ -1,8 +1,11 @@
 import SwiftUI
 import AppKit
+import Combine
 
 @main
 enum Entry {
+    private static var delegate: AppDelegate?
+
     static func main() {
         let args = CommandLine.arguments
         if let i = args.firstIndex(of: "--dry-run-selftest"), i + 1 < args.count {
@@ -40,74 +43,192 @@ enum Entry {
             exit(code)
         }
         if Debug.changes { setlinebuf(stdout) }
-        ClarpingApp.main()
-    }
-}
-
-struct ClarpingApp: App {
-    // The delegate owns AppState and is not an ObservableObject, so the scene
-    // body (and with it the MenuBarExtra button) is not re-evaluated on every
-    // published change; only the views that read AppState re-render.
-    @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
-
-    var body: some Scene {
-        MenuBarExtra {
-            PopoverView()
-                .environmentObject(delegate.state)
-        } label: {
-            MenuBarLabel(model: delegate.state.menuBar)
-                .onAppear { delegate.attach() }
-        }
-        .menuBarExtraStyle(.window)
-        .commands {
-            CommandGroup(replacing: .appSettings) {
-                Button("Settings...") { WindowManager.shared.show(.settings) }.keyboardShortcut(",")
-            }
-        }
+        // Plain AppKit lifecycle: the status item and its popover are AppKit
+        // objects (see StatusItemController). SwiftUI's MenuBarExtra re-hosted
+        // and re-rendered its label on every scene update, which spun the main
+        // thread whenever the label or the open popover changed per frame.
+        let app = NSApplication.shared
+        let d = AppDelegate()
+        delegate = d
+        app.delegate = d
+        app.run()
     }
 }
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let state = AppState(paths: .real)
-    private var started = false
+    private(set) var statusItem: StatusItemController?
 
-    func attach() {
-        guard !started else { return }
-        started = true
-        let s = state
-        WindowManager.shared.state = s
-        s.start()
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.setActivationPolicy(.accessory)
+        NSApp.mainMenu = AppDelegate.makeMenu()
+        WindowManager.shared.state = state
+        statusItem = StatusItemController(model: state.menuBar, content: PopoverView().environmentObject(state))
+        state.start()
+        installDebugHooks()
+    }
+
+    @objc private func showSettings(_ sender: Any?) { WindowManager.shared.show(.settings) }
+
+    /// App menu (Settings, Quit) and Edit menu so text fields get the standard
+    /// shortcuts; the app is an accessory, so the menu is visible only while the
+    /// main window is open.
+    private static func makeMenu() -> NSMenu {
+        let menu = NSMenu()
+        let appItem = NSMenuItem()
+        let appMenu = NSMenu()
+        appMenu.addItem(withTitle: "Settings…", action: #selector(showSettings(_:)), keyEquivalent: ",")
+        appMenu.addItem(.separator())
+        appMenu.addItem(withTitle: "Quit Clarping", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        appItem.submenu = appMenu
+        menu.addItem(appItem)
+        let editItem = NSMenuItem()
+        let edit = NSMenu(title: "Edit")
+        edit.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+        edit.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "Z")
+        edit.addItem(.separator())
+        edit.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        edit.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        edit.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        edit.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editItem.submenu = edit
+        menu.addItem(editItem)
+        return menu
+    }
+
+    /// Debug-only environment hooks (all off by default):
+    /// CLARPING_DEBUG_OPEN_POPOVER=1  click the status item after 2 s.
+    /// CLARPING_DEBUG_CONFIRM=1       open the switch-confirm panel on the first inactive account at 4 s (UI only).
+    /// CLARPING_DEBUG_DRY_SWITCH=1    at 6 s show the switch-in-progress state for 30 s without touching
+    ///                                keychain or files (no Switcher call is made).
+    /// CLARPING_DEBUG_POLL_AT=<s>     run one real poll cycle <s> seconds after launch.
+    /// CLARPING_DEBUG_SHOW=1          open the main window; CLARPING_DEBUG_SHOT=<dir> writes PNGs.
+    private func installDebugHooks() {
         let env = ProcessInfo.processInfo.environment
-        // CLARPING_DEBUG_OPEN_POPOVER=1: click the status item after launch (reproduces the
-        // open-popover state headlessly). CLARPING_DEBUG_CONFIRM=1: also open the
-        // switch-confirm panel on the first inactive account (UI only, no switch).
+        let s = state
         if env["CLARPING_DEBUG_OPEN_POPOVER"] == "1" {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { WindowManager.clickStatusItem() }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                Debug.log("clicking status item")
+                self?.statusItem?.item.button?.performClick(nil)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+                    Debug.log("popover shown=\(self?.statusItem?.popover.isShown ?? false) size=\(self?.statusItem?.popover.contentSize ?? .zero)")
+                }
+            }
         }
         if env["CLARPING_DEBUG_CONFIRM"] == "1" {
             DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
-                if let a = s.accounts.first(where: { $0.id != s.activeId }) { s.requestSwitch(to: a) }
+                if let a = s.accounts.first(where: { $0.id != s.activeId }) { s.requestSwitch(to: a); Debug.log("confirm panel opened") }
             }
         }
-        if env["CLARPING_DEBUG_SHOW"] == "1" {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
-                WindowManager.shared.show(.dashboard)
-                WindowManager.shared.showPopoverPreview()
+        if env["CLARPING_DEBUG_DRY_SWITCH"] == "1" {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 6) {
+                guard let a = s.accounts.first(where: { $0.id != s.activeId }) ?? s.accounts.first else { return }
+                s.confirmTarget = nil
+                s.switchingTo = a.id
+                s.switchStep = .writingKeychain
+                Debug.log("dry switch state ON")
+                DispatchQueue.main.asyncAfter(deadline: .now() + 30) {
+                    s.switchingTo = nil
+                    s.switchStep = nil
+                    Debug.log("dry switch state OFF")
+                }
             }
-            // CLARPING_DEBUG_SHOT=<dir>: render each window to PNG after data has loaded.
-            if let dir = ProcessInfo.processInfo.environment["CLARPING_DEBUG_SHOT"] {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 14) { WindowManager.shared.snapshot(to: dir, suffix: "dashboard") }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 16) {
+        }
+        if let at = env["CLARPING_DEBUG_POLL_AT"].flatMap(Double.init) {
+            // Run a real poll cycle at a known time (for example with the popover open).
+            DispatchQueue.main.asyncAfter(deadline: .now() + at) { Debug.log("debug poll start"); Task { await s.pollAll(); Debug.log("debug poll end") } }
+        }
+        if env["CLARPING_DEBUG_SHOW"] == "1" {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { WindowManager.shared.show(.dashboard) }
+            if let dir = env["CLARPING_DEBUG_SHOT"] {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 14) { [weak self] in self?.snapshot(to: dir, suffix: "dashboard") }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 16) { [weak self] in
                     WindowManager.shared.show(.settings)
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { WindowManager.shared.snapshot(to: dir, suffix: "settings") }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { self?.snapshot(to: dir, suffix: "settings") }
                 }
             }
         }
     }
 
-    func applicationDidFinishLaunching(_ notification: Notification) {
-        NSApp.setActivationPolicy(.accessory)
+    /// Debug only: writes PNGs of the main window, the popover content and the status item image.
+    private func snapshot(to dir: String, suffix: String) {
+        let out = URL(fileURLWithPath: dir)
+        if let img = statusItem?.item.button?.image, let tiff = img.tiffRepresentation,
+           let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]) {
+            try? png.write(to: out.appendingPathComponent("menubar-\(suffix).png"))
+        }
+        var views: [(NSView?, String)] = [(WindowManager.shared.windowContentView, "main-\(suffix)")]
+        views.append((statusItem?.popover.contentViewController?.view, "popover-\(suffix)"))
+        for (v, name) in views {
+            guard let v, let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds) else { continue }
+            v.cacheDisplay(in: v.bounds, to: rep)
+            if let png = rep.representation(using: .png, properties: [:]) {
+                try? png.write(to: out.appendingPathComponent("\(name).png"))
+            }
+        }
+    }
+}
+
+/// AppKit status item and popover. The button image is set only when one of
+/// the three MenuBarModel values changes; the switch-in-progress cue is a
+/// CoreAnimation opacity pulse on the button layer, never a per-frame
+/// SwiftUI re-render. The popover hosts the SwiftUI PopoverView; all state it
+/// shows lives in AppState, so a transient close (for example when Claude
+/// Desktop relaunches and takes focus mid-switch) loses nothing.
+@MainActor
+final class StatusItemController: NSObject {
+    let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    let popover = NSPopover()
+    private var sinks = Set<AnyCancellable>()
+
+    init<Content: View>(model: MenuBarModel, content: Content) {
+        super.init()
+        let host = NSHostingController(rootView: content)
+        host.sizingOptions = [.preferredContentSize]
+        popover.contentViewController = host
+        popover.behavior = .transient
+        popover.animates = true
+        if let b = item.button {
+            b.target = self
+            b.action = #selector(toggle(_:))
+            b.imagePosition = .imageOnly
+            b.toolTip = "Clarping"
+        }
+        model.$fill.combineLatest(model.$text, model.$switching)
+            .removeDuplicates { $0 == $1 }
+            .receive(on: RunLoop.main)
+            .sink { [weak self] fill, text, switching in self?.apply(fill: fill, text: text, switching: switching) }
+            .store(in: &sinks)
+    }
+
+    private func apply(fill: Int?, text: String?, switching: Bool) {
+        guard let b = item.button else { return }
+        Debug.log("status item image update fill=\(fill.map(String.init) ?? "-") switching=\(switching)")
+        b.image = SparkIcon.labelImage(fill: fill, text: text, switching: switching)
+        b.wantsLayer = true
+        if switching, !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            if b.layer?.animation(forKey: "pulse") == nil {
+                let a = CABasicAnimation(keyPath: "opacity")
+                a.fromValue = 1.0
+                a.toValue = 0.4
+                a.duration = 0.7
+                a.autoreverses = true
+                a.repeatCount = .infinity
+                b.layer?.add(a, forKey: "pulse")
+            }
+        } else {
+            b.layer?.removeAnimation(forKey: "pulse")
+        }
+    }
+
+    @objc private func toggle(_ sender: Any?) {
+        if popover.isShown { popover.performClose(sender) } else { show() }
+    }
+
+    func show() {
+        guard let b = item.button else { return }
+        popover.show(relativeTo: b.bounds, of: b, preferredEdge: .minY)
     }
 }
 
@@ -118,7 +239,7 @@ final class WindowManager: NSObject, NSWindowDelegate {
     static let shared = WindowManager()
     var state: AppState?
     private var window: NSWindow?
-    private var preview: NSWindow?
+    var windowContentView: NSView? { window?.contentView }
 
     func show(_ tab: MainTab) {
         guard let state else { return }
@@ -143,91 +264,13 @@ final class WindowManager: NSObject, NSWindowDelegate {
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    /// Debug only: presses the MenuBarExtra status item button.
-    static func clickStatusItem() {
-        func find(_ v: NSView) -> NSStatusBarButton? {
-            if let b = v as? NSStatusBarButton { return b }
-            for s in v.subviews { if let b = find(s) { return b } }
-            return nil
-        }
-        for w in NSApp.windows {
-            guard let cv = w.contentView, let b = find(cv) else { continue }
-            // A real mouse down/up through NSApp.sendEvent, so the MenuBarExtra
-            // controller sees a click event (performClick alone does not open the window).
-            let p = b.convert(NSPoint(x: b.bounds.midX, y: b.bounds.midY), to: nil)
-            Debug.log("clicking status item at window point \(p) frame \(w.frame)")
-            func ev(_ t: NSEvent.EventType) -> NSEvent? {
-                NSEvent.mouseEvent(with: t, location: p, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
-                                   windowNumber: w.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: t == .leftMouseUp ? 0 : 1)
-            }
-            if let down = ev(.leftMouseDown), let up = ev(.leftMouseUp) {
-                NSApp.postEvent(up, atStart: false)
-                NSApp.sendEvent(down)
-            }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
-                Debug.log("windows: " + NSApp.windows.map { "\(type(of: $0)) visible=\($0.isVisible) \(Int($0.frame.width))x\(Int($0.frame.height))" }.joined(separator: "; "))
-                if ProcessInfo.processInfo.environment["CLARPING_DEBUG_HOVER"] == "1" { startSyntheticHover() }
-            }
-            return
-        }
-        Debug.log("status item button not found")
-    }
-
-    /// Debug only: streams mouseMoved events across the open popover window
-    /// (the largest visible non-status window) to stand in for a hovering pointer.
-    static func startSyntheticHover() {
-        guard let w = NSApp.windows.filter({ $0.isVisible && !($0 is NSPanel && $0.frame.height < 30) && String(describing: type(of: $0)) != "NSStatusBarWindow" })
-                .max(by: { $0.frame.height < $1.frame.height }) else { Debug.log("hover: no popover window"); return }
-        Debug.log("hover: over \(type(of: w)) \(w.frame)")
-        var i = 0
-        Timer.scheduledTimer(withTimeInterval: 0.03, repeats: true) { _ in
-            i += 1
-            let x = CGFloat(20 + (i * 7) % max(1, Int(w.frame.width) - 40))
-            let y = CGFloat(20 + (i * 11) % max(1, Int(w.frame.height) - 40))
-            if let e = NSEvent.mouseEvent(with: .mouseMoved, location: NSPoint(x: x, y: y), modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
-                                          windowNumber: w.windowNumber, context: nil, eventNumber: i, clickCount: 0, pressure: 0) {
-                NSApp.sendEvent(e)
-            }
-        }
-    }
-
     func windowWillClose(_ notification: Notification) {
         guard (notification.object as? NSWindow) == window else { return }
-        if preview == nil || preview?.isVisible == false { NSApp.setActivationPolicy(.accessory) }
-    }
-
-    /// Debug only: writes PNGs of the main window, popover preview and menu bar label.
-    func snapshot(to dir: String, suffix: String) {
-        if let state {
-            let r = ImageRenderer(content: MenuBarLabel(model: state.menuBar).padding(6).background(Color(nsColor: .windowBackgroundColor)))
-            r.scale = 4
-            if let img = r.nsImage, let tiff = img.tiffRepresentation, let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]) {
-                try? png.write(to: URL(fileURLWithPath: dir).appendingPathComponent("menubar-\(suffix).png"))
-            }
-        }
-        for (w, name) in [(window, "main-\(suffix)"), (preview, "popover-\(suffix)")] {
-            guard let v = w?.contentView, let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds) else { continue }
-            v.cacheDisplay(in: v.bounds, to: rep)
-            if let png = rep.representation(using: .png, properties: [:]) {
-                try? png.write(to: URL(fileURLWithPath: dir).appendingPathComponent("\(name).png"))
-            }
-        }
-    }
-
-    /// Debug only: hosts the popover content in a plain window so it can be captured.
-    func showPopoverPreview() {
-        guard let state else { return }
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 340, height: 10), styleMask: [.titled, .closable], backing: .buffered, defer: false)
-        w.title = "Popover preview"
-        w.contentView = NSHostingView(rootView: PopoverView().environmentObject(state))
-        w.setFrameTopLeftPoint(NSPoint(x: 60, y: (NSScreen.main?.visibleFrame.maxY ?? 800) - 20))
-        w.isReleasedWhenClosed = false
-        w.makeKeyAndOrderFront(nil)
-        preview = w
+        NSApp.setActivationPolicy(.accessory)
     }
 }
 
-/// CLARPING_DEBUG_CHANGES=1 prints which views re-render and why (stdout).
+/// CLARPING_DEBUG_CHANGES=1 prints which views re-render and why (stderr).
 enum Debug {
     static let changes = ProcessInfo.processInfo.environment["CLARPING_DEBUG_CHANGES"] == "1"
     static var counts: [String: Int] = [:]

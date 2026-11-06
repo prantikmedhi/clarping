@@ -52,16 +52,16 @@ enum SparkIcon {
         return img
     }
 
-    /// One template image holding the glyph and the optional usage text, so the
-    /// MenuBarExtra label is a plain `Image`: SwiftUI then sets it on the status
-    /// button directly instead of snapshotting a hosted view on every update.
-    /// Keyed by (whole-percent fill, text); the cache is bounded.
+    /// One template image holding the glyph and the optional usage text; it is
+    /// set on the status item button directly. Keyed by (whole-percent fill,
+    /// text, switching); the cache is bounded. While a switch runs the glyph is
+    /// drawn turned and slightly smaller; the pulse is a layer animation.
     private static var cache: [String: NSImage] = [:]
-    static func labelImage(fill: Int?, text: String?) -> NSImage {
-        let key = "\(fill.map(String.init) ?? "-")|\(text ?? "")"
+    static func labelImage(fill: Int?, text: String?, switching: Bool = false) -> NSImage {
+        let key = "\(fill.map(String.init) ?? "-")|\(text ?? "")|\(switching)"
         if let img = cache[key] { return img }
         if cache.count > 64 { cache.removeAll() }
-        let glyph = image(fill: fill.map(Double.init), angle: 0, scale: 1)
+        let glyph = image(fill: fill.map(Double.init), angle: switching ? 45 : 0, scale: switching ? 0.9 : 1)
         let img: NSImage
         if let text, !text.isEmpty {
             let font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
@@ -84,33 +84,10 @@ enum SparkIcon {
     }
 }
 
-/// The only state the status item label depends on. AppState writes it
-/// solely when a value actually changes, so the label (and the expensive
-/// MenuBarExtra button re-render behind it) is not invalidated by every
-/// @Published change in the app.
+/// The only state the status item depends on. AppState writes it solely when a
+/// value actually changes; StatusItemController sets the button image from it.
 final class MenuBarModel: ObservableObject {
     @Published var fill: Int?        // whole-percent 5-hour utilization of the active account
     @Published var text: String?
     @Published var switching = false
-}
-
-struct MenuBarLabel: View {
-    @ObservedObject var model: MenuBarModel
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-
-    var body: some View {
-        if Debug.changes { Debug.tick("MenuBarLabel"); Self._printChanges() }
-        return Group {
-            if model.switching && !reduceMotion {
-                // Only while a switch runs: a 20 fps spin of the glyph alone.
-                TimelineView(.animation(minimumInterval: 1 / 20)) { ctx in
-                    let t = ctx.date.timeIntervalSinceReferenceDate
-                    Image(nsImage: SparkIcon.image(fill: model.fill.map(Double.init), angle: (t * 60).truncatingRemainder(dividingBy: 360),
-                                                   scale: 0.9 + 0.1 * (0.5 + 0.5 * sin(t * 4))))
-                }
-            } else {
-                Image(nsImage: SparkIcon.labelImage(fill: model.fill, text: model.text))
-            }
-        }
-    }
 }
