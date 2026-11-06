@@ -1,4 +1,5 @@
 import Foundation
+import SQLite3
 
 /// `clarping --dry-run-selftest <tmpHome>`: exercises capture -> switch -> verify
 /// against fake files under a temporary HOME and the throwaway keychain
@@ -185,6 +186,26 @@ enum SelfTest {
             check("rollback: Desktop file backup folder written", !desktopBackups.isEmpty)
             try fm.removeItem(at: paths.desktopDir.appendingPathComponent("IndexedDB"))
             try fm.removeItem(at: bDir.appendingPathComponent("IndexedDB"))
+
+            // 4d. a signed-out Desktop (no claude.ai sessionKey cookie) never
+            // replaces a good snapshot.
+            let ck = home.appendingPathComponent("ck.db")
+            var db: OpaquePointer?
+            sqlite3_open(ck.path, &db)
+            sqlite3_exec(db, "CREATE TABLE cookies(host_key TEXT, name TEXT, expires_utc INTEGER); INSERT INTO cookies VALUES('.claude.ai','lastActiveOrg',0);", nil, nil, nil)
+            sqlite3_close(db)
+            check("signed-out: cookie db without sessionKey detected", Switcher.hasSessionCookie(ck) == false)
+            try fm.removeItem(at: paths.desktopDir.appendingPathComponent("Cookies"))
+            try fm.copyItem(at: ck, to: paths.desktopDir.appendingPathComponent("Cookies"))
+            check("signed-out: snapshot refused", (try? sw.snapshotDesktop(for: ids[0])) == false)
+            check("signed-out: previous snapshot kept", (try? String(contentsOf: vault.desktopSnapshotDir(for: ids[0]).appendingPathComponent("Cookies"))) == "cookies-A")
+            sqlite3_open(ck.path, &db)
+            sqlite3_exec(db, "INSERT INTO cookies VALUES('.claude.ai','sessionKey',99999999999999999);", nil, nil, nil)
+            sqlite3_close(db)
+            check("signed-in: cookie db with sessionKey detected", Switcher.hasSessionCookie(ck) == true)
+            check("signed-in: non-sqlite cookies file is unknown", Switcher.hasSessionCookie(vault.desktopSnapshotDir(for: ids[0]).appendingPathComponent("Cookies")) == nil)
+            try fm.removeItem(at: paths.desktopDir.appendingPathComponent("Cookies"))
+            try Data("cookies-A".utf8).write(to: paths.desktopDir.appendingPathComponent("Cookies"))
 
             // 5. token ingest on a fake session log
             let proj = paths.claudeProjects.appendingPathComponent("p")

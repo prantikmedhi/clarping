@@ -65,8 +65,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.mainMenu = AppDelegate.makeMenu()
         WindowManager.shared.state = state
         statusItem = StatusItemController(model: state.menuBar, content: PopoverView().environmentObject(state))
+        WindowManager.shared.showPopover = { [weak self] in self?.statusItem?.show() }
         state.start()
         installDebugHooks()
+        // First run: the setup guide, once. Re-openable from Settings.
+        if !state.settings.onboardingDone, ProcessInfo.processInfo.environment["CLARPING_DEBUG_SHOT"] == nil {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { WindowManager.shared.showOnboarding() }
+        }
     }
 
     @objc private func showSettings(_ sender: Any?) { WindowManager.shared.show(.settings) }
@@ -103,7 +108,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// CLARPING_DEBUG_DRY_SWITCH=1    at 6 s show the switch-in-progress state for 30 s without touching
     ///                                keychain or files (no Switcher call is made).
     /// CLARPING_DEBUG_POLL_AT=<s>     run one real poll cycle <s> seconds after launch.
-    /// CLARPING_DEBUG_SHOW=1          open the main window; CLARPING_DEBUG_SHOT=<dir> writes PNGs.
+    /// CLARPING_DEBUG_SHOW=1          open the main window; CLARPING_DEBUG_ONBOARDING=1 opens the setup guide.
+    /// CLARPING_DEBUG_SHOT=<dir>      writes PNGs: popover (3 s), popover with confirm (5 s, needs CONFIRM),
+    ///                                dashboard (14 s), settings (17.5 s), each onboarding step (20 s + 1.5 s per step).
     private func installDebugHooks() {
         let env = ProcessInfo.processInfo.environment
         let s = state
@@ -139,32 +146,65 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // Run a real poll cycle at a known time (for example with the popover open).
             DispatchQueue.main.asyncAfter(deadline: .now() + at) { Debug.log("debug poll start"); Task { await s.pollAll(); Debug.log("debug poll end") } }
         }
+        if env["CLARPING_DEBUG_ONBOARDING"] == "1" {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { WindowManager.shared.showOnboarding() }
+        }
         if env["CLARPING_DEBUG_SHOW"] == "1" {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { WindowManager.shared.show(.dashboard) }
             if let dir = env["CLARPING_DEBUG_SHOT"] {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in self?.snapshot(to: dir, suffix: "popover") }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in self?.snapshot(to: dir, suffix: "popover-confirm") }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 14) { [weak self] in self?.snapshot(to: dir, suffix: "dashboard") }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 16) { [weak self] in
                     WindowManager.shared.show(.settings)
                     DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { self?.snapshot(to: dir, suffix: "settings") }
                 }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 19) { WindowManager.shared.showOnboarding() }
+                // Sequential (each capture takes a moment; absolute timers drifted past the next step).
+                DispatchQueue.main.asyncAfter(deadline: .now() + 20) { [weak self] in self?.captureOnboarding(step: 0, to: dir) }
             }
         }
     }
 
-    /// Debug only: writes PNGs of the main window, the popover content and the status item image.
+    /// Debug only: steps the setup guide and captures each page in turn.
+    private func captureOnboarding(step: Int, to dir: String) {
+        guard step < 7 else { return }
+        state.onboardingStep = step
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) { [weak self] in
+            self?.snapshot(to: dir, suffix: "onboarding-\(step + 1)")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { self?.captureOnboarding(step: step + 1, to: dir) }
+        }
+    }
+
+    /// Debug only: writes PNGs. `<suffix>.png` is the view that step is about
+    /// (popover*, dashboard / settings = main window, onboarding-N = setup
+    /// guide), rendered with `cacheDisplay` (no real glass blur), plus
+    /// `<suffix>-window.png` from `screencapture -l` of the real window when
+    /// Screen Recording permission allows it. The status item image is written
+    /// once as menubar.png.
     private func snapshot(to dir: String, suffix: String) {
         let out = URL(fileURLWithPath: dir)
-        if let img = statusItem?.item.button?.image, let tiff = img.tiffRepresentation,
+        try? FileManager.default.createDirectory(at: out, withIntermediateDirectories: true)
+        if suffix == "popover", let img = statusItem?.item.button?.image, let tiff = img.tiffRepresentation,
            let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]) {
-            try? png.write(to: out.appendingPathComponent("menubar-\(suffix).png"))
+            try? png.write(to: out.appendingPathComponent("menubar.png"))
         }
-        var views: [(NSView?, String)] = [(WindowManager.shared.windowContentView, "main-\(suffix)")]
-        views.append((statusItem?.popover.contentViewController?.view, "popover-\(suffix)"))
-        for (v, name) in views {
-            guard let v, let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds) else { continue }
-            v.cacheDisplay(in: v.bounds, to: rep)
+        let view: NSView?
+        if suffix.hasPrefix("popover") { view = statusItem?.popover.contentViewController?.view }
+        else if suffix.hasPrefix("onboarding") { view = WindowManager.shared.onboardingContentView }
+        else { view = WindowManager.shared.windowContentView }
+        guard let view else { Debug.log("snapshot \(suffix): no view"); return }
+        if let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) {
+            view.cacheDisplay(in: view.bounds, to: rep)
             if let png = rep.representation(using: .png, properties: [:]) {
-                try? png.write(to: out.appendingPathComponent("\(name).png"))
+                try? png.write(to: out.appendingPathComponent("\(suffix).png"))
+            }
+        }
+        if let num = view.window?.windowNumber {
+            let path = out.appendingPathComponent("\(suffix)-window.png").path
+            // Off-main: screencapture can take a moment; nothing here touches app state.
+            Task.detached(priority: .utility) {
+                _ = try? Shell.run("/usr/sbin/screencapture", ["-x", "-o", "-l", String(num), path])
             }
         }
     }
@@ -239,7 +279,34 @@ final class WindowManager: NSObject, NSWindowDelegate {
     static let shared = WindowManager()
     var state: AppState?
     private var window: NSWindow?
+    private var onboarding: NSWindow?
     var windowContentView: NSView? { window?.contentView }
+    var onboardingContentView: NSView? { onboarding?.contentView }
+    /// Opens the menu bar popover (set by AppDelegate; used by the setup guide).
+    var showPopover: (() -> Void)?
+
+    /// The first-run setup guide; one fixed-size window, re-shown on request.
+    func showOnboarding() {
+        guard let state else { return }
+        if onboarding == nil {
+            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 760, height: 540),
+                             styleMask: [.titled, .closable, .fullSizeContentView], backing: .buffered, defer: false)
+            w.title = "Clarping Setup"
+            w.titleVisibility = .hidden
+            w.titlebarAppearsTransparent = true
+            w.isMovableByWindowBackground = true
+            w.contentView = NSHostingView(rootView: OnboardingView().environmentObject(state))
+            w.center()
+            w.isReleasedWhenClosed = false
+            w.delegate = self
+            onboarding = w
+        }
+        NSApp.setActivationPolicy(.regular)
+        onboarding?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    func closeOnboarding() { onboarding?.close() }
 
     func show(_ tab: MainTab) {
         guard let state else { return }
@@ -265,8 +332,10 @@ final class WindowManager: NSObject, NSWindowDelegate {
     }
 
     func windowWillClose(_ notification: Notification) {
-        guard (notification.object as? NSWindow) == window else { return }
-        NSApp.setActivationPolicy(.accessory)
+        guard let closing = notification.object as? NSWindow, closing == window || closing == onboarding else { return }
+        if closing == onboarding { state?.finishOnboarding() }
+        let other = closing == window ? onboarding : window
+        if other?.isVisible != true { NSApp.setActivationPolicy(.accessory) }
     }
 }
 

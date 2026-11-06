@@ -90,3 +90,152 @@ final class Box<T>: ObservableObject {
     @Published var value: T
     init(_ v: T) { value = v }
 }
+
+// MARK: - Liquid Glass surfaces
+//
+// Real system glass (`glassEffect`, `GlassEffectContainer`, `.buttonStyle(.glass)`)
+// on macOS 26 and later; on older systems, or with Reduce Transparency on, the
+// same views fall back to solid cream cards. Every animation in the app is a
+// settle spring that runs once when a value changes; nothing loops.
+
+extension Theme {
+    /// Warm tint laid into the glass so it reads as cream, not grey.
+    static let glassTint = Color.adaptive(light: 0xFFF9F0, dark: 0x2A2623)
+    /// Tint for the active (lifted) account card.
+    static let glassTintActive = Color.adaptive(light: 0xFFF4EA, dark: 0x3A2E27)
+
+    /// One-shot settle when a gauge value or layout changes.
+    static let settle = Animation.spring(duration: 0.45, bounce: 0.12)
+    /// Card lift / morph on switch.
+    static let lift = Animation.spring(duration: 0.4, bounce: 0.2)
+    /// Quick crossfades (status text, tab content).
+    static let quick = Animation.smooth(duration: 0.25)
+
+    /// Debug only: CLARPING_DEBUG_FLAT=1 forces the solid fallback everywhere
+    /// (`cacheDisplay` snapshots cannot draw system glass, so documentation
+    /// screenshots are rendered flat).
+    static let forceSolid = ProcessInfo.processInfo.environment["CLARPING_DEBUG_FLAT"] == "1"
+
+    /// Whether system Liquid Glass can be drawn right now.
+    static func glassAvailable(reduceTransparency: Bool) -> Bool {
+        if reduceTransparency || forceSolid { return false }
+        if #available(macOS 26.0, *) { return true }
+        return false
+    }
+}
+
+/// A glass panel (regular variant, cream tint) that falls back to a solid card.
+/// `lifted` adds a warmer tint and a soft shadow for the active account.
+struct GlassSurface: ViewModifier {
+    var radius: CGFloat = 14
+    var lifted = false
+    var interactive = false
+    var tint: Color? = nil
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+
+    func body(content: Content) -> some View {
+        let shape = RoundedRectangle(cornerRadius: radius, style: .continuous)
+        if #available(macOS 26.0, *), !reduceTransparency, !Theme.forceSolid {
+            content
+                .glassEffect(.regular.tint((tint ?? (lifted ? Theme.glassTintActive : Theme.glassTint)).opacity(lifted ? 0.85 : 0.7)).interactive(interactive), in: shape)
+                .shadow(color: .black.opacity(lifted ? 0.08 : 0), radius: lifted ? 14 : 0, y: lifted ? 6 : 0)
+        } else {
+            content
+                .background(shape.fill(lifted ? Theme.cardLifted : Theme.card))
+                .overlay(shape.stroke(Theme.hairline, lineWidth: 1))
+                .shadow(color: .black.opacity(lifted ? 0.10 : 0.03), radius: lifted ? 10 : 2, y: lifted ? 4 : 1)
+        }
+    }
+}
+
+extension View {
+    /// Glass panel with the given corner radius; solid card when glass is unavailable.
+    func glassSurface(radius: CGFloat = 14, lifted: Bool = false, interactive: Bool = false, tint: Color? = nil) -> some View {
+        modifier(GlassSurface(radius: radius, lifted: lifted, interactive: interactive, tint: tint))
+    }
+
+    /// Groups sibling glass shapes so they blend and morph together
+    /// (`GlassEffectContainer`); a plain group elsewhere.
+    @ViewBuilder
+    func glassGroup<Content: View>(spacing: CGFloat = 16, @ViewBuilder _ content: () -> Content) -> some View {
+        if #available(macOS 26.0, *), !Theme.forceSolid {
+            GlassEffectContainer(spacing: spacing) { content() }
+        } else {
+            content()
+        }
+    }
+}
+
+/// Wraps content in a GlassEffectContainer when available. Use around a stack
+/// of glass surfaces so neighbouring shapes merge as they move.
+struct GlassGroup<Content: View>: View {
+    var spacing: CGFloat = 16
+    @ViewBuilder var content: () -> Content
+    var body: some View {
+        if #available(macOS 26.0, *), !Theme.forceSolid {
+            GlassEffectContainer(spacing: spacing) { content() }
+        } else {
+            content()
+        }
+    }
+}
+
+/// Small text button: system glass (`.glass` / `.glassProminent`, clay tinted)
+/// when available, the quiet cream style otherwise. 12 pt medium label.
+struct SoftButton<Label: View>: View {
+    var prominent = false
+    var action: () -> Void
+    @ViewBuilder var label: () -> Label
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+
+    init(prominent: Bool = false, action: @escaping () -> Void, @ViewBuilder label: @escaping () -> Label) {
+        self.prominent = prominent; self.action = action; self.label = label
+    }
+
+    var body: some View {
+        if #available(macOS 26.0, *), !reduceTransparency, !Theme.forceSolid {
+            if prominent {
+                Button(action: action) { label().font(.system(size: 12, weight: .medium)).padding(.horizontal, 2) }
+                    .buttonStyle(.glassProminent).tint(Theme.clayDeep).controlSize(.small)
+            } else {
+                Button(action: action) { label().font(.system(size: 12, weight: .medium)).foregroundStyle(Theme.ink).padding(.horizontal, 2) }
+                    .buttonStyle(.glass).controlSize(.small)
+            }
+        } else {
+            Button(action: action, label: label).buttonStyle(QuietButtonStyle(prominent: prominent))
+        }
+    }
+}
+
+extension SoftButton where Label == Text {
+    init(_ title: String, prominent: Bool = false, action: @escaping () -> Void) {
+        self.init(prominent: prominent, action: action) { Text(title) }
+    }
+}
+
+/// Plan badge ("Max 5x", "Pro"): a quiet capsule, clay on cream.
+struct PlanBadge: View {
+    var name: String
+    var body: some View {
+        Text(name)
+            .font(.system(size: 10, weight: .semibold))
+            .tracking(0.2)
+            .foregroundStyle(Theme.clayDeep)
+            .padding(.horizontal, 6).padding(.vertical, 2)
+            .background(Capsule().fill(Theme.clay.opacity(0.14)))
+            .accessibilityLabel("Plan \(name)")
+    }
+}
+
+/// Window / popover background: cream with two very soft warm pools so glass
+/// above it has something to refract. Static; nothing animates here.
+struct AmbientBackground: View {
+    var body: some View {
+        ZStack {
+            Theme.background
+            RadialGradient(colors: [Theme.clay.opacity(0.10), .clear], center: .topLeading, startRadius: 0, endRadius: 420)
+            RadialGradient(colors: [Theme.amber.opacity(0.07), .clear], center: .bottomTrailing, startRadius: 0, endRadius: 380)
+        }
+        .ignoresSafeArea()
+    }
+}

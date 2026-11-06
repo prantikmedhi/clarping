@@ -49,6 +49,9 @@ final class AppState: ObservableObject {
     /// rather than on every render.
     @Published var projections: [String: TimeInterval] = [:]
     @Published var captureNote: String?
+    /// Current page of the setup guide (0...6); driven by the onboarding window
+    /// and by the debug snapshot hook.
+    @Published var onboardingStep = 0
 
     private var pollTask: Task<Void, Never>?
     private var ingesting = false
@@ -106,7 +109,10 @@ final class AppState: ObservableObject {
             let stats = await self?.io.run { vault.loadTokenStats() } ?? TokenStats()
             guard let self else { return }
             self.tokenStats = stats
-            self.restartPolling()
+            // Debug only: CLARPING_DEBUG_NO_POLL=1 skips the automatic poll
+            // (snapshot runs; the keychain prompt of a rebuilt binary would
+            // otherwise hold the IO worker and every live check behind it).
+            if ProcessInfo.processInfo.environment["CLARPING_DEBUG_NO_POLL"] != "1" { self.restartPolling() }
         }
     }
 
@@ -420,6 +426,63 @@ final class AppState: ObservableObject {
             }
         }
         persistAccounts()
+    }
+
+    // MARK: Onboarding (live checks; all reads happen off the main actor)
+
+    struct CLILogin: Equatable {
+        var id: String
+        var email: String
+        /// The keychain item holds a login token (signed in, not just a stale ~/.claude.json).
+        var hasToken: Bool
+        /// Already linked in Clarping's vault.
+        var linked: Bool
+    }
+
+    /// What `claude` is signed in as right now. nil when nothing is signed in.
+    func detectCLILogin() async -> CLILogin? {
+        let sw = switcher
+        let r: (String, String, Bool)? = await io.run {
+            guard let cfg = try? sw.readClaudeJSON(), let oa = cfg["oauthAccount"] as? [String: Any],
+                  let id = oa["accountUuid"] as? String else { return nil }
+            let token = (try? sw.readCLICreds())?.accessToken != nil
+            return (id, oa["emailAddress"] as? String ?? "", token)
+        }
+        guard let r else { return nil }
+        return CLILogin(id: r.0, email: r.1, hasToken: r.2, linked: accounts.contains { $0.id == r.0 })
+    }
+
+    struct DesktopStatus: Equatable {
+        var installed: Bool
+        var running: Bool
+        /// nil when unknown (no cookie database yet).
+        var signedIn: Bool?
+        /// Account Desktop itself reports (`lastKnownAccountUuid`), if any.
+        var accountId: String?
+        /// Whether that account is linked and has a Desktop snapshot.
+        var captured: Bool
+    }
+
+    /// Claude Desktop's state: installed, running, signed in, captured.
+    func detectDesktop() async -> DesktopStatus {
+        let sw = switcher, paths = self.paths
+        let r: (Bool, Bool, Bool?, String?) = await io.run {
+            let installed = paths.desktopBundleID.flatMap { NSWorkspace.shared.urlForApplication(withBundleIdentifier: $0) } != nil
+                || FileManager.default.fileExists(atPath: paths.desktopDir.path)
+            let running = sw.isDesktopRunning()
+            let signedIn = Switcher.hasSessionCookie(paths.desktopDir.appendingPathComponent("Cookies"))
+            let id = (try? sw.readDesktopConfig())?["lastKnownAccountUuid"] as? String
+            return (installed, running, signedIn, id)
+        }
+        let captured = r.3.flatMap { id in accounts.first { $0.id == id }?.hasDesktopSnapshot } ?? false
+        return DesktopStatus(installed: r.0, running: r.1, signedIn: r.2, accountId: r.3, captured: captured)
+    }
+
+    /// Marks the setup guide as seen (Settings -> "Setup guide" reopens it).
+    func finishOnboarding() {
+        guard !settings.onboardingDone else { return }
+        settings.onboardingDone = true
+        saveSettings()
     }
 
     // MARK: Tokens

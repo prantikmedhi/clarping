@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import SQLite3
 
 enum SwitchStep: String, CaseIterable {
     case quittingDesktop = "Quitting Claude Desktop"
@@ -129,12 +130,15 @@ final class Switcher {
             accounts[i].lastCaptured = now
             accounts[i].hasDesktopSnapshot = hasDesktop || accounts[i].hasDesktopSnapshot
             accounts[i].needsRelogin = false
+            accounts[i].subscriptionType = creds.subscriptionType ?? accounts[i].subscriptionType
+            accounts[i].rateLimitTier = creds.rateLimitTier ?? accounts[i].rateLimitTier
             return accounts[i]
         }
         let label = (oa["displayName"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? (email.split(separator: "@").first.map(String.init) ?? "Account")
         let a = Account(id: id, label: label, colorHex: AccountColors.next(after: accounts.map(\.colorHex)), email: email, orgName: org,
                         createdAt: now, lastCaptured: now, oauthAccount: [String: JSONValue](anyDictionary: oa),
-                        hasDesktopSnapshot: hasDesktop, needsRelogin: false)
+                        hasDesktopSnapshot: hasDesktop, needsRelogin: false,
+                        subscriptionType: creds.subscriptionType, rateLimitTier: creds.rateLimitTier)
         accounts.append(a)
         return a
     }
@@ -159,6 +163,12 @@ final class Switcher {
         if currentId != nil, !alreadyActive {
             // Refresh tokens rotate; make sure the vault has whatever the CLI holds now.
             try await captureCurrent(into: &accounts, desktop: doDesktop ? .alreadyQuiet : .skipIfRunning)
+        }
+        if doDesktop {
+            // Desktop may be signed in as a linked account other than the CLI's
+            // (or ~/.claude.json may already name the target): file its live
+            // login under the account Desktop itself reports before replacing it.
+            try snapshotDesktopByOwnAccount(accounts: &accounts)
         }
         guard let creds = try vault.cliCreds(for: target.id) else {
             throw SwitchError(message: "No stored login for \(target.label). Re-capture it while it is active.")
@@ -298,7 +308,7 @@ final class Switcher {
     // MARK: Desktop
 
     /// nil when config.json does not exist; throws when it exists but is not JSON.
-    private func readDesktopConfig() throws -> [String: Any]? {
+    func readDesktopConfig() throws -> [String: Any]? {
         guard fm.fileExists(atPath: paths.desktopConfig.path) else { return nil }
         let d = try Data(contentsOf: paths.desktopConfig)
         guard let o = try JSONSerialization.jsonObject(with: d) as? [String: Any] else {
@@ -334,6 +344,13 @@ final class Switcher {
             try? fm.removeItem(at: tmp)
             throw error
         }
+        // A signed-out Desktop (no live claude.ai session cookie) must never
+        // replace a snapshot: restoring it would land on the sign-in screen.
+        if Switcher.hasSessionCookie(tmp.appendingPathComponent("Cookies")) == false {
+            try? fm.removeItem(at: tmp)
+            lastCaptureNote = "Claude Desktop is signed out; its login was not saved. Sign Desktop in and re-capture."
+            return false
+        }
         if fm.fileExists(atPath: dest.path) { try fm.removeItem(at: dest) }
         try fm.moveItem(at: tmp, to: dest)
         if let cfg {
@@ -343,6 +360,36 @@ final class Switcher {
             copied = copied || !keys.isEmpty
         }
         return copied
+    }
+
+    /// Snapshots Desktop under the linked account named by its own
+    /// `lastKnownAccountUuid`. Returns that id when a snapshot was taken.
+    @discardableResult
+    func snapshotDesktopByOwnAccount(accounts: inout [Account]) throws -> String? {
+        guard let did = try readDesktopConfig()?["lastKnownAccountUuid"] as? String,
+              let i = accounts.firstIndex(where: { $0.id == did }),
+              try snapshotDesktop(for: did) else { return nil }
+        accounts[i].hasDesktopSnapshot = true
+        return did
+    }
+
+    /// Whether a copied Desktop `Cookies` database holds an unexpired claude.ai
+    /// `sessionKey*` cookie (names and expiry only; values are never read).
+    /// nil when the file is missing or not a cookie database.
+    static func hasSessionCookie(_ cookies: URL) -> Bool? {
+        guard FileManager.default.fileExists(atPath: cookies.path) else { return nil }
+        let path = cookies.path.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? cookies.path
+        var db: OpaquePointer?
+        defer { sqlite3_close(db) }
+        guard sqlite3_open_v2("file:\(path)?immutable=1", &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, nil) == SQLITE_OK else { return nil }
+        var st: OpaquePointer?
+        defer { sqlite3_finalize(st) }
+        let sql = "SELECT count(*) FROM cookies WHERE host_key IN ('.claude.ai','claude.ai') AND name LIKE 'sessionKey%' AND (expires_utc = 0 OR expires_utc > ?)"
+        guard sqlite3_prepare_v2(db, sql, -1, &st, nil) == SQLITE_OK else { return nil }
+        // Chromium time: microseconds since 1601-01-01.
+        sqlite3_bind_int64(st, 1, Int64((Date().timeIntervalSince1970 + 11_644_473_600) * 1_000_000))
+        guard sqlite3_step(st) == SQLITE_ROW else { return nil }
+        return sqlite3_column_int64(st, 0) > 0
     }
 
     func restoreDesktop(for id: String) throws {
